@@ -19,6 +19,7 @@
 #include "archive_ppmd7_private.h"
 #include "archive_private.h"
 #include "archive_read_private.h"
+#include "archive_entry_private.h"
 
 struct rar5 {
     int header_initialized;
@@ -199,7 +200,111 @@ process_main_locator_extra_block(struct archive_read* a, struct rar5* rar) {
 
 static int
 process_head_file(struct archive_read* a, struct rar5* rar, struct archive_entry* entry, size_t block_flags) {
-    LOG("file/service block");
+    int ret;
+    size_t extra_data_size, data_size, file_flags, unpacked_size,
+        file_attr, compression_info, host_os, name_size;
+    uint32_t mtime, crc;
+    int c_method, c_version, is_dir;
+    char name_utf8_buf[2048 * 4];
+    const uint8_t* p;
+
+    if(block_flags & HFL_EXTRA_DATA) {
+        if(!__rar_read_var(a, &extra_data_size, NULL))
+            return ARCHIVE_EOF;
+
+        LOG("process_head_file: has extra data, size: 0x%08zx bytes", extra_data_size);
+        LOG("*** not supported yet");
+        return ARCHIVE_FATAL;
+    }
+
+    if(block_flags & HFL_DATA) {
+        if(!__rar_read_var(a, &data_size, NULL))
+            return ARCHIVE_EOF;
+    }
+
+    enum FILE_FLAGS {
+        DIRECTORY = 0x0001, UTIME = 0x0002, CRC32 = 0x0004, UNKNOWN_UNPACKED_SIZE = 0x0008,
+    };
+
+    if(!__rar_read_var(a, &file_flags, NULL))
+        return ARCHIVE_EOF;
+
+    if(!__rar_read_var(a, &unpacked_size, NULL))
+        return ARCHIVE_EOF;
+
+    if(file_flags & UNKNOWN_UNPACKED_SIZE) {
+        unpacked_size = 0;
+        LOG("*** unknown unpacked size, not handled!");
+        return ARCHIVE_FAILED;
+    }
+
+    is_dir = (int) (file_flags & DIRECTORY);
+
+    if(!__rar_read_var(a, &file_attr, NULL))
+        return ARCHIVE_EOF;
+
+    if(file_flags & UTIME) {
+        if(!__rar_read_u32(a, &mtime))
+            return ARCHIVE_EOF;
+    }
+
+    if(file_flags & CRC32) {
+        if(!__rar_read_u32(a, &crc))
+            return ARCHIVE_EOF;
+    }
+
+    if(!__rar_read_var(a, &compression_info, NULL))
+        return ARCHIVE_EOF;
+
+    c_method = (int) (compression_info >> 7) & 0x7;
+    c_version = (int) (compression_info & 0x3f);
+
+    if(!__rar_read_var(a, &host_os, NULL))
+        return ARCHIVE_EOF;
+
+    if(!__rar_read_var(a, &name_size, NULL))
+        return ARCHIVE_EOF;
+
+    if(!__rar_read_ahead(a, name_size, &p))
+        return ARCHIVE_EOF;
+
+    if(name_size > 2047) {
+        // TODO: name too long, failing
+        LOG("*** name too long, fail");
+        return ARCHIVE_FATAL;
+    }
+
+    if(name_size == 0) {
+        // TODO: no name specifiec, failing
+        return ARCHIVE_FATAL;
+    }
+
+    memcpy(name_utf8_buf, p, name_size);
+    name_utf8_buf[name_size] = 0;
+    __archive_read_consume(a, name_size);
+
+    LOG("name: %s, dir? %d", name_utf8_buf, is_dir);
+
+    if(extra_data_size > 0) {
+        size_t extra_field_size;
+        size_t extra_field_id;
+
+        enum EXTRA {
+            CRYPT = 0x01, HASH = 0x02, HTIME = 0x03, VERSION_ = 0x04, REDIR = 0x05, UOWNER = 0x06, SUBDATA = 0x07
+        };
+
+        if(!__rar_read_var(a, &extra_field_size, NULL))
+            return ARCHIVE_EOF;
+
+        if(!__rar_read_var(a, &extra_field_id, NULL))
+            return ARCHIVE_EOF;
+
+        // ...
+    }
+
+    memset(entry, 0, sizeof(struct archive_entry));
+    archive_entry_set_size(entry, unpacked_size);
+
     return ARCHIVE_FAILED;
 }
 
