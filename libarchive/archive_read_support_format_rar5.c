@@ -4,7 +4,6 @@
 #include <errno.h>
 #endif
 #include <time.h>
-#include <limits.h>
 #ifdef HAVE_ZLIB_H
 #include <zlib.h> /* crc32 */
 #endif
@@ -13,12 +12,10 @@
 #ifndef HAVE_ZLIB_H
 #include "archive_crc32.h"
 #endif
-#include "archive_endian.h"
+
 #include "archive_entry.h"
 #include "archive_entry_locale.h"
 #include "archive_ppmd7_private.h"
-#include "archive_private.h"
-#include "archive_read_private.h"
 #include "archive_entry_private.h"
 
 struct rar5 {
@@ -26,13 +23,15 @@ struct rar5 {
     int skipped_magic;
     uint64_t qlist_offset;
     uint64_t rr_offset;
+    uint8_t* unpack_buf;
 };
 
-void rar5_init(struct rar5* rar) {
+static void rar5_init(struct rar5* rar) {
     rar->header_initialized = 0;
     rar->skipped_magic = 0;
     rar->qlist_offset = 0;
     rar->rr_offset = 0;
+    rar->unpack_buf = NULL;
 }
 
 #define UNUSED(x) (void) (x)
@@ -40,9 +39,9 @@ void rar5_init(struct rar5* rar) {
 
 const unsigned char rar5_signature[] = { 0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00 };
 const size_t rar5_signature_size = sizeof(rar5_signature);
+const size_t g_unpack_buf_chunk_size = 32;
 
-static inline
-int __get_archive_read(struct archive* a, struct archive_read** ar) {
+static inline int __get_archive_read(struct archive* a, struct archive_read** ar) {
     *ar = (struct archive_read*) a;
 
     archive_check_magic(a, ARCHIVE_READ_MAGIC, ARCHIVE_STATE_NEW,
@@ -56,7 +55,7 @@ struct rar5* __get_context(struct archive_read* a) {
     return (struct rar5*) a->format->data;
 }
 
-int __rar_read_ahead(struct archive_read* a, size_t how_many, const uint8_t** ptr) {
+static int __rar_read_ahead(struct archive_read* a, size_t how_many, const uint8_t** ptr) {
     if(!ptr)
         return 0;
 
@@ -67,7 +66,7 @@ int __rar_read_ahead(struct archive_read* a, size_t how_many, const uint8_t** pt
     return 1;
 }
 
-int __rar_read_var(struct archive_read* a, uint64_t* pvalue, size_t* pvalue_len) {
+static int __rar_read_var(struct archive_read* a, uint64_t* pvalue, size_t* pvalue_len) {
     uint64_t result = 0;
     size_t shift, i;
     const uint8_t* p;
@@ -98,6 +97,7 @@ int __rar_read_var(struct archive_read* a, uint64_t* pvalue, size_t* pvalue_len)
     return 0;
 }
 
+int __rar_read_u32(struct archive_read* a, uint32_t* pvalue);
 int __rar_read_u32(struct archive_read* a, uint32_t* pvalue) {
     const uint8_t* p;
 
@@ -110,8 +110,7 @@ int __rar_read_u32(struct archive_read* a, uint32_t* pvalue) {
     return 1;
 }
 
-static int
-bid_standard(struct archive_read* a) {
+static int bid_standard(struct archive_read* a) {
     const uint8_t* p;
 
     if(!__rar_read_ahead(a, rar5_signature_size, &p))
@@ -125,13 +124,14 @@ bid_standard(struct archive_read* a) {
 
 static int
 bid_sfx(struct archive_read* a) {
+    UNUSED(a);
+
     // TODO implement this
     return -1;
 }
 
 static int
 rar5_bid(struct archive_read* a, int best_bid) {
-    struct rar5* ctx = __get_context(a);
     int my_bid;
 
     LOG("rar5_bid");
@@ -155,11 +155,17 @@ rar5_bid(struct archive_read* a, int best_bid) {
 
 static int
 rar5_options(struct archive_read *a, const char *key, const char *val) {
+    UNUSED(a);
+    UNUSED(key);
+    UNUSED(val);
+
     return ARCHIVE_FATAL;
 }
 
 static void
 init_header(struct archive_read* a, struct rar5* rar) {
+    UNUSED(rar);
+
     a->archive.archive_format = ARCHIVE_FORMAT_RAR_V5;
     a->archive.archive_format_name = "RAR";
 }
@@ -200,13 +206,17 @@ process_main_locator_extra_block(struct archive_read* a, struct rar5* rar) {
 
 static int
 process_head_file(struct archive_read* a, struct rar5* rar, struct archive_entry* entry, size_t block_flags) {
-    int ret;
-    size_t extra_data_size, data_size, file_flags, unpacked_size,
+    UNUSED(rar);
+
+    size_t extra_data_size = 0, data_size, file_flags, unpacked_size,
         file_attr, compression_info, host_os, name_size;
-    uint32_t mtime, crc;
-    int c_method, c_version, is_dir;
+    uint32_t mtime = 0, crc;
+    int c_method = 0, c_version = 0, is_dir;
     char name_utf8_buf[2048 * 4];
     const uint8_t* p;
+
+    UNUSED(c_method);
+    UNUSED(c_version);
 
     if(block_flags & HFL_EXTRA_DATA) {
         if(!__rar_read_var(a, &extra_data_size, NULL))
@@ -299,17 +309,22 @@ process_head_file(struct archive_read* a, struct rar5* rar, struct archive_entry
         if(!__rar_read_var(a, &extra_field_id, NULL))
             return ARCHIVE_EOF;
 
-        // ...
+        LOG("*** EXTRA in file/service block, not supported yet");
+        return ARCHIVE_FAILED;
     }
 
     memset(entry, 0, sizeof(struct archive_entry));
     archive_entry_set_size(entry, unpacked_size);
+    archive_entry_update_pathname_utf8(entry, name_utf8_buf);
+    archive_entry_set_ctime(entry, (time_t) mtime, 0);
 
-    return ARCHIVE_FAILED;
+    return ARCHIVE_OK;
 }
 
 static int
 process_head_main(struct archive_read* a, struct rar5* rar, struct archive_entry* entry, size_t block_flags) {
+    UNUSED(entry);
+
     int ret;
     size_t extra_data_size,
         extra_field_size,
@@ -424,16 +439,19 @@ process_base_block(struct archive_read* a, struct rar5* rar, struct archive_entr
     switch(header_id) {
         case HEAD_MAIN:
             ret = process_head_main(a, rar, entry, header_flags);
+
+            // Main header doesn't have any files in it, so it's pointless
+            // to return to the caller. Retry to next header, which should be
+            // HEAD_FILE/HEAD_SERVICE.
             if(ret == ARCHIVE_OK)
                 return ARCHIVE_RETRY;
             break;
         case HEAD_FILE:
         case HEAD_SERVICE:
             ret = process_head_file(a, rar, entry, header_flags);
-            if(ret == ARCHIVE_OK)
-                return ARCHIVE_RETRY;
-            break;
-            return ARCHIVE_FATAL;
+            // TODO if this block didn't have any data in it, retry
+            // TODO to next block.
+            return ret;
         case HEAD_CRYPT:
             return ARCHIVE_FATAL;
         case HEAD_ENDARC:
@@ -448,6 +466,10 @@ process_base_block(struct archive_read* a, struct rar5* rar, struct archive_entr
                 return ARCHIVE_RETRY;
             }
     }
+
+    // Not reached.
+    archive_set_error(&a->archive, ARCHIVE_ERRNO_PROGRAMMER, "Internal unpacked error");
+    return ARCHIVE_FATAL;
 }
 
 static int
@@ -477,24 +499,50 @@ rar5_read_header(struct archive_read *a, struct archive_entry *entry)
 static int
 rar5_read_data(struct archive_read *a, const void **buff,
                                   size_t *size, int64_t *offset) {
+    UNUSED(a);
+    UNUSED(buff);
+    UNUSED(size);
+    UNUSED(offset);
+
+    struct rar5* rar = __get_context(a);
+    if(rar->unpack_buf == NULL) {
+        rar->unpack_buf = malloc(g_unpack_buf_chunk_size);
+        LOG("allocated unpack_buf=%p", (void*) rar->unpack_buf);
+        if(!rar->unpack_buf) {
+            archive_set_error(&a->archive, ENOMEM, "Can't allocate decompression buffer");
+            return ARCHIVE_FATAL;
+        }
+    }
+
+
     return ARCHIVE_FATAL;
 }
 
 static int
 rar5_read_data_skip(struct archive_read *a) {
+    UNUSED(a);
     return ARCHIVE_FATAL;
 }
 
 static int64_t
 rar5_seek_data(struct archive_read *a, int64_t offset,
                                   int whence) {
+    UNUSED(a);
+    UNUSED(offset);
+    UNUSED(whence);
     return ARCHIVE_FATAL;
 }
 
 static int
 rar5_cleanup(struct archive_read *a)
 {
-    return ARCHIVE_FATAL;
+    struct rar5* rar = __get_context(a);
+
+    if(rar->unpack_buf)
+        free(rar->unpack_buf);
+
+    free(rar);
+    return ARCHIVE_OK;
 }
 
 static int
@@ -509,10 +557,9 @@ rar5_capabilities(struct archive_read * a)
 static int
 rar5_has_encrypted_entries(struct archive_read *_a)
 {
+    UNUSED(_a);
     return ARCHIVE_READ_FORMAT_ENCRYPTION_DONT_KNOW;
 }
-
-
 
 int
 archive_read_support_format_rar5(struct archive *_a) {
