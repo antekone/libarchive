@@ -19,8 +19,12 @@
 #include "archive_entry_private.h"
 
 struct file_header {
+    uint32_t stored_crc32;
+    uint32_t calculated_crc32;
     uint64_t unpacked_size;
     uint64_t packed_size;
+    uint64_t bytes_remaining;
+    uint64_t read_offset; // offset in the compressed stream
 };
 
 enum BLOCK_TYPE {
@@ -51,6 +55,15 @@ struct comp_info {
     enum BLOCK_TYPE block_type;
 };
 
+static const int BIT_READER_MAX_BUF = 0x8000;
+
+struct bit_reader {
+    uint8_t* buf;
+    int buf_size;
+    int bit_addr;
+    int in_addr;
+};
+
 struct rar5 {
     int header_initialized;
     int skipped_magic;
@@ -62,10 +75,13 @@ struct rar5 {
 
     struct comp_info compression;
     struct file_header file;
+    struct bit_reader bits;
 };
 
+#define RAR5_MIN(a, b) (((a) > (b)) ? (b) : (a))
+
 static void rar5_init(struct rar5* rar) {
-    memset(&rar, 0, sizeof(struct rar5));
+    memset(rar, 0, sizeof(struct rar5));
 }
 
 static void set_solid(struct rar5* rar, int flag) {
@@ -283,6 +299,7 @@ process_head_file(struct archive_read* a, struct rar5* rar, struct archive_entry
             return ARCHIVE_EOF;
 
         rar->file.packed_size = data_size;
+        rar->file.bytes_remaining = rar->file.packed_size;
         LOG("data size: 0x%08zx", data_size);
     } else {
         LOG("*** FILE/SERVICE block without data, failing");
@@ -390,7 +407,15 @@ process_head_file(struct archive_read* a, struct rar5* rar, struct archive_entry
     if(file_flags & UTIME)
         archive_entry_set_ctime(entry, (time_t) mtime, 0);
 
+    if(file_flags & CRC32) {
+        if(!read_u32(a, &rar->file.stored_crc32))
+            return ARCHIVE_EOF;
+
+        LOG("stored CRC32 of this file: %x", rar->file.stored_crc32);
+    }
+
     archive_entry_update_pathname_utf8(entry, name_utf8_buf);
+    LOG("file pointer is positioned at a file record");
     return ARCHIVE_OK;
 }
 
@@ -569,14 +594,103 @@ rar5_read_header(struct archive_read *a, struct archive_entry *entry)
     return ret;
 }
 
+static void bit_init(struct bit_reader* bits) {
+    if(bits->buf)
+        free(bits->buf);
+
+    bits->buf = malloc(3 + BIT_READER_MAX_BUF); // TODO: verify null pointer
+    memset(bits->buf, 0, 3 + BIT_READER_MAX_BUF);
+    bits->bit_addr = 0;
+    bits->in_addr = 0;
+}
+
+static void bit_fill(struct bit_reader* bits, struct archive_read* a, size_t size) {
+    const uint8_t* buf;
+    read_ahead(a, size, &buf); // TODO: check success
+    memcpy(bits->buf, buf, size);
+}
+
+static void bit_skip(int n) {
+    UNUSED(n);
+}
+
+static uint16_t bit_get16() {
+    return 0;
+}
+
+static uint32_t bit_get32() {
+    return 0;
+}
+
 static void init_unpack(struct rar5* rar) {
     rar->compression.block_type = BLOCK_LZ;
     rar->compression.window_mask = rar->compression.window_size - 1;
     memset(rar->compression.huffman_table, 0, HUFF_TABLE_SIZE);
     set_tables_read(rar, False);
+    bit_init(&rar->bits);
 }
 
-static void do_unpack(struct archive_read* a, struct rar5* rar) {
+static int do_unstore_file(struct archive_read* a, 
+                           struct rar5* rar,
+                           const void** buf,
+                           size_t* size,
+                           int64_t* offset) 
+{
+    const uint8_t* p;
+
+    LOG("unstoring file, remaining bytes: %lx", rar->file.bytes_remaining);
+
+    size_t to_read = RAR5_MIN(rar->file.bytes_remaining, a->archive.read_data_requested);
+    if(!read_ahead(a, to_read, &p)) {
+        LOG("I/O error during do_unstore_file");
+        archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT, "I/O error when unstoring file");
+        return ARCHIVE_FATAL;
+    }
+
+    *buf = p;
+    *size = rar->file.bytes_remaining;
+    *offset = rar->file.read_offset;
+
+    // TODO: update crc of unpacked file
+
+    rar->file.bytes_remaining -= to_read;
+    rar->file.read_offset += to_read;
+    rar->file.calculated_crc32 = crc32(rar->file.calculated_crc32, p, to_read);
+    return ARCHIVE_OK;
+}
+
+static int do_unpack(struct archive_read* a, 
+                     struct rar5* rar, 
+                     const void** buf, 
+                     size_t* size, 
+                     int64_t* offset) 
+{
+    LOG("do_unpack, compression method: %d", rar->compression.method);
+
+    if(is_solid(rar)) {
+        LOG("TODO: solid archives are not supported yet");
+        return ARCHIVE_FATAL;
+    }
+
+    if(rar->compression.method > 5) {
+        LOG("do_unpack: Unknown compression method");
+        archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT, "Unknown compression method");
+        return ARCHIVE_FATAL;
+    }
+
+    enum COMPRESSION_METHOD {
+        STORE = 0, FASTEST = 1, FAST = 2, NORMAL = 3, GOOD = 4, BEST = 5
+    };
+
+    switch(rar->compression.method) {
+        case STORE:
+            return do_unstore_file(a, rar, buf, size, offset);
+        default:
+            LOG("TODO: compression method not supported yet");
+            return ARCHIVE_FATAL;
+    }
+
+    return ARCHIVE_OK;
 }
 
 static int rar5_read_data(struct archive_read *a, const void **buff,
@@ -602,14 +716,26 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
 
     LOG("ask for data: %zu", a->archive.read_data_requested);
 
-    do_unpack(a, rar);
+    int ret = do_unpack(a, rar, buff, size, offset);
+    if(ret != ARCHIVE_OK) {
+        LOG("do_unpack returned error: %d", ret);
+        return ret;
+    }
 
-    memset(rar->unpack_buf, 0, g_unpack_buf_chunk_size);
-    *buff = rar->unpack_buf;
-    *size = bytes_requested;
-    *offset = 0;
+    if(rar->file.bytes_remaining == 0) {
+        // Sanity check.
+        if(rar->file.read_offset > rar->file.packed_size) {
+            LOG("something is wrong: offset is bigger than packed size");
+            return ARCHIVE_FATAL;
+        }
 
-    return ARCHIVE_FATAL;
+        // Fully unpacked the file.
+
+        LOG("got crc: %x, should be: %x", rar->file.calculated_crc32,
+                                          rar->file.stored_crc32);
+    }
+
+    return ARCHIVE_OK;
 }
 
 static int
