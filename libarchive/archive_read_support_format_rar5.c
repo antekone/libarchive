@@ -33,7 +33,7 @@ struct file_header {
     uint64_t e_mtime;
     uint64_t e_ctime;
     uint64_t e_atime;
-    uint32_t e_unknown;
+    uint32_t e_unix_ns;
 
     // optional hash fields
     uint8_t blake2sp[32];
@@ -360,12 +360,11 @@ static int parse_file_extra_htime(struct archive_read* a, struct rar5* rar, ssiz
     size_t value_len;
 
     enum HTIME_FLAGS {
-        IS_UNIX = 1,
-        HAS_MTIME = 2,
-        HAS_CTIME = 4,
-        HAS_ATIME = 8,
-        HAS_UNKNOWN = 0x10,
-        // TODO: check this UNKNOWN entry on Windows rar.exe
+        IS_UNIX       = 0x01,
+        HAS_MTIME     = 0x02,
+        HAS_CTIME     = 0x04,
+        HAS_ATIME     = 0x08,
+        HAS_UNIX_NS   = 0x10,
     };
 
     if(!read_var(a, &flags, &value_len))
@@ -385,8 +384,8 @@ static int parse_file_extra_htime(struct archive_read* a, struct rar5* rar, ssiz
     if(flags & HAS_ATIME)
         parse_htime_item(a, unix_time, &rar->file.e_atime, extra_data_size);
 
-    if(flags & HAS_UNKNOWN) {
-        if(!read_u32(a, &rar->file.e_unknown))
+    if(flags & HAS_UNIX_NS) {
+        if(!read_u32(a, &rar->file.e_unix_ns))
             return ARCHIVE_EOF;
 
         *extra_data_size -= 4;
@@ -894,7 +893,7 @@ static int do_unpack(struct archive_read* a,
         case STORE:
             return do_unstore_file(a, rar, buf, size, offset);
         default:
-            LOG("TODO: compression method not supported yet");
+            LOG("TODO: compression method not supported yet: %d", rar->compression.method);
             return ARCHIVE_FATAL;
     }
 
