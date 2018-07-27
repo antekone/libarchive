@@ -297,6 +297,22 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
         if(!read_var(a, &extra_data_size, NULL))
             return ARCHIVE_EOF;
 
+        ssize_t data_size = (ssize_t) extra_data_size;
+        if(data_size < 0) {
+            LOG("extra data is negative, *** not supported yet");
+            return ARCHIVE_FATAL;
+        }
+
+        enum FILE_EXTRA {
+            CRYPT = 0x01,     // encryption parameters
+            HASH = 0x02,      // blake2 hash
+            HTIME = 0x03,     // high precision file time
+            FE_VERSION = 0x04,   // file version, FE_ prefix added to prevent macro name collision
+            REDIR = 0x05,     // filesystem redirection object
+            UOWNER = 0x06,    // unix permissions
+            SUBDATA = 0x07    // service header subdata
+        };
+
         LOG("process_head_file: has extra data, size: 0x%08zx bytes", extra_data_size);
         LOG("*** not supported yet");
         return ARCHIVE_FATAL;
