@@ -18,6 +18,8 @@
 #include "archive_ppmd7_private.h"
 #include "archive_entry_private.h"
 
+static int rar5_read_data_skip(struct archive_read *a);
+
 struct file_header {
     uint32_t stored_crc32;
     uint32_t calculated_crc32;
@@ -25,6 +27,7 @@ struct file_header {
     uint64_t packed_size;
     uint64_t bytes_remaining;
     uint64_t read_offset; // offset in the compressed stream
+    uint64_t prev_read_bytes;
 };
 
 enum BLOCK_TYPE {
@@ -82,6 +85,10 @@ struct rar5 {
 
 static void rar5_init(struct rar5* rar) {
     memset(rar, 0, sizeof(struct rar5));
+}
+
+void reset_file_context(struct rar5* rar) {
+    memset(&rar->file, 0, sizeof(rar->file));
 }
 
 static void set_solid(struct rar5* rar, int flag) {
@@ -271,8 +278,7 @@ process_main_locator_extra_block(struct archive_read* a, struct rar5* rar) {
     return ARCHIVE_OK;
 }
 
-static int
-process_head_file(struct archive_read* a, struct rar5* rar, struct archive_entry* entry, size_t block_flags) {
+static int process_head_file(struct archive_read* a, struct rar5* rar, struct archive_entry* entry, size_t block_flags) {
     UNUSED(rar);
 
     size_t extra_data_size = 0, data_size, file_flags, unpacked_size,
@@ -284,6 +290,8 @@ process_head_file(struct archive_read* a, struct rar5* rar, struct archive_entry
 
     UNUSED(c_method);
     UNUSED(c_version);
+
+    reset_file_context(rar);
 
     if(block_flags & HFL_EXTRA_DATA) {
         if(!read_var(a, &extra_data_size, NULL))
@@ -407,20 +415,31 @@ process_head_file(struct archive_read* a, struct rar5* rar, struct archive_entry
     if(file_flags & UTIME)
         archive_entry_set_ctime(entry, (time_t) mtime, 0);
 
-    if(file_flags & CRC32) {
-        if(!read_u32(a, &rar->file.stored_crc32))
-            return ARCHIVE_EOF;
-
-        LOG("stored CRC32 of this file: %x", rar->file.stored_crc32);
-    }
+    if(file_flags & CRC32)
+        rar->file.stored_crc32 = crc;
 
     archive_entry_update_pathname_utf8(entry, name_utf8_buf);
     LOG("file pointer is positioned at a file record");
     return ARCHIVE_OK;
 }
 
-static int
-process_head_main(struct archive_read* a, struct rar5* rar, struct archive_entry* entry, size_t block_flags) {
+static int process_head_service(struct archive_read* a, struct rar5* rar, struct archive_entry* entry, size_t block_flags) {
+    // Process this SERVICE block the same way as FILE blocks
+    int ret = process_head_file(a, rar, entry, block_flags);
+    if(ret != ARCHIVE_OK)
+        return ret;
+
+    // But skip the data part automatically. It's no use for the user anyway.
+    // It contains only service data needed to properly unpack the archive.
+    ret = rar5_read_data_skip(a);
+    if(ret != ARCHIVE_OK)
+        return ret;
+
+    // After skipping, try parsing another block automatically. 
+    return ARCHIVE_RETRY;
+}
+
+static int process_head_main(struct archive_read* a, struct rar5* rar, struct archive_entry* entry, size_t block_flags) {
     UNUSED(entry);
 
     int ret;
@@ -487,8 +506,7 @@ process_head_main(struct archive_read* a, struct rar5* rar, struct archive_entry
     return ARCHIVE_OK;
 }
 
-static int
-process_base_block(struct archive_read* a, struct rar5* rar, struct archive_entry* entry) {
+static int process_base_block(struct archive_read* a, struct rar5* rar, struct archive_entry* entry) {
     uint32_t hdr_crc, computed_crc;
     size_t raw_hdr_size, hdr_size_len, hdr_size;
     size_t header_id, header_flags;
@@ -500,7 +518,7 @@ process_base_block(struct archive_read* a, struct rar5* rar, struct archive_entr
         return ARCHIVE_EOF;
     }
 
-    LOG("crc: 0x%08x", hdr_crc);
+    LOG("hdr_crc=%08x", hdr_crc);
 
     if(!read_var(a, &raw_hdr_size, &hdr_size_len))
         return ARCHIVE_EOF;
@@ -534,6 +552,7 @@ process_base_block(struct archive_read* a, struct rar5* rar, struct archive_entr
         HEAD_CRYPT = 0x04, HEAD_ENDARC = 0x05, HEAD_UNKNOWN = 0xff,
     };
 
+    LOG("header_id=%02x", header_id);
     switch(header_id) {
         case HEAD_MAIN:
             ret = process_head_main(a, rar, entry, header_flags);
@@ -544,8 +563,10 @@ process_base_block(struct archive_read* a, struct rar5* rar, struct archive_entr
             if(ret == ARCHIVE_OK)
                 return ARCHIVE_RETRY;
             break;
-        case HEAD_FILE:
         case HEAD_SERVICE:
+            ret = process_head_service(a, rar, entry, header_flags);
+            return ret;
+        case HEAD_FILE:
             ret = process_head_file(a, rar, entry, header_flags);
             // TODO if this block didn't have any data in it, retry
             // TODO to next block.
@@ -575,6 +596,13 @@ rar5_read_header(struct archive_read *a, struct archive_entry *entry)
 {
     struct rar5* rar = get_context(a);
     int ret;
+
+    const uint8_t* p = NULL;
+    if(!read_ahead(a, 4, &p)) {
+        LOG("read_ahead failed");
+    } else {
+        printf("ptr now is %02x %02x %02x %02x\n", p[0], p[1], p[2], p[3]);
+    }
 
     if(rar->header_initialized == 0) {
         init_header(a, rar);
@@ -623,11 +651,18 @@ static uint32_t bit_get32() {
 }
 
 static void init_unpack(struct rar5* rar) {
+    rar->file.calculated_crc32 = 0;
+    rar->file.read_offset = 0;
+
     rar->compression.block_type = BLOCK_LZ;
     rar->compression.window_mask = rar->compression.window_size - 1;
     memset(rar->compression.huffman_table, 0, HUFF_TABLE_SIZE);
     set_tables_read(rar, False);
     bit_init(&rar->bits);
+}
+
+void update_crc(struct rar5* rar, const uint8_t* p, size_t to_read) {
+    rar->file.calculated_crc32 = crc32(rar->file.calculated_crc32, p, to_read);
 }
 
 static int do_unstore_file(struct archive_read* a, 
@@ -638,7 +673,9 @@ static int do_unstore_file(struct archive_read* a,
 {
     const uint8_t* p;
 
-    LOG("unstoring file, remaining bytes: %lx", rar->file.bytes_remaining);
+    (void) __archive_read_consume(a, rar->file.prev_read_bytes);
+
+    LOG("unstoring file, remaining bytes: 0x%lx", rar->file.bytes_remaining);
 
     size_t to_read = RAR5_MIN(rar->file.bytes_remaining, a->archive.read_data_requested);
     if(!read_ahead(a, to_read, &p)) {
@@ -651,11 +688,10 @@ static int do_unstore_file(struct archive_read* a,
     *size = rar->file.bytes_remaining;
     *offset = rar->file.read_offset;
 
-    // TODO: update crc of unpacked file
-
+    rar->file.prev_read_bytes = to_read;
     rar->file.bytes_remaining -= to_read;
     rar->file.read_offset += to_read;
-    rar->file.calculated_crc32 = crc32(rar->file.calculated_crc32, p, to_read);
+    update_crc(rar, p, to_read);
     return ARCHIVE_OK;
 }
 
@@ -723,29 +759,51 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
     }
 
     if(rar->file.bytes_remaining == 0) {
+        // Fully unpacked the file.
+        //
         // Sanity check.
         if(rar->file.read_offset > rar->file.packed_size) {
             LOG("something is wrong: offset is bigger than packed size");
+            LOG("read_offset=0x%08x", rar->file.read_offset);
+            LOG("packed_size=0x%08x", rar->file.packed_size);
             return ARCHIVE_FATAL;
         }
 
-        // Fully unpacked the file.
+        // Some FILE entries in RARv5 are optional entries with extra data,
+        // i.e. the "QO" section. Those sections doesn't have CRC info, so we
+        // can't use standard file CRC entry to verify them.
+        //
+        // In cases where CRC isn't used, it's simply stored as 0.
+        char check_crc = rar->file.stored_crc32 > 0;
 
-        LOG("got crc: %x, should be: %x", rar->file.calculated_crc32,
-                                          rar->file.stored_crc32);
+        if(check_crc && (rar->file.calculated_crc32 != rar->file.stored_crc32)) {
+            LOG("checksum error: calculated=%x, valid=%x",
+                    rar->file.calculated_crc32,
+                    rar->file.stored_crc32);
+
+            archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                              "File CRC error");
+            return ARCHIVE_FATAL;
+        } else {
+            LOG("warning: this entry doesn't have CRC info");
+        }
     }
 
     return ARCHIVE_OK;
 }
 
-static int
-rar5_read_data_skip(struct archive_read *a) {
-    UNUSED(a);
-    return ARCHIVE_FATAL;
+static int rar5_read_data_skip(struct archive_read *a) {
+    struct rar5* rar = get_context(a);
+
+    (void) __archive_read_consume(a, rar->file.bytes_remaining + rar->file.prev_read_bytes);
+
+    rar->file.prev_read_bytes = 0;
+    rar->file.bytes_remaining = 0;
+
+    return ARCHIVE_OK;
 }
 
-static int64_t
-rar5_seek_data(struct archive_read *a, int64_t offset,
+static int64_t rar5_seek_data(struct archive_read *a, int64_t offset,
                                   int whence) {
     UNUSED(a);
     UNUSED(offset);
@@ -753,8 +811,7 @@ rar5_seek_data(struct archive_read *a, int64_t offset,
     return ARCHIVE_FATAL;
 }
 
-static int
-rar5_cleanup(struct archive_read *a)
+static int rar5_cleanup(struct archive_read *a)
 {
     struct rar5* rar = get_context(a);
 
@@ -765,8 +822,7 @@ rar5_cleanup(struct archive_read *a)
     return ARCHIVE_OK;
 }
 
-static int
-rar5_capabilities(struct archive_read * a)
+static int rar5_capabilities(struct archive_read * a)
 {
     UNUSED(a);
 
@@ -774,8 +830,7 @@ rar5_capabilities(struct archive_read * a)
             | ARCHIVE_READ_FORMAT_CAPS_ENCRYPT_METADATA);
 }
 
-static int
-rar5_has_encrypted_entries(struct archive_read *_a)
+static int rar5_has_encrypted_entries(struct archive_read *_a)
 {
     UNUSED(_a);
     return ARCHIVE_READ_FORMAT_ENCRYPTION_DONT_KNOW;
