@@ -28,6 +28,12 @@ struct file_header {
     uint64_t bytes_remaining;
     uint64_t read_offset; // offset in the compressed stream
     uint64_t prev_read_bytes;
+
+    // extra fields
+    uint64_t e_mtime;
+    uint64_t e_ctime;
+    uint64_t e_atime;
+    uint32_t e_unknown;
 };
 
 enum BLOCK_TYPE {
@@ -184,6 +190,19 @@ int read_u32(struct archive_read* a, uint32_t* pvalue) {
     return 1;
 }
 
+int read_u64(struct archive_read* a, uint64_t* pvalue);
+int read_u64(struct archive_read* a, uint64_t* pvalue) {
+    const uint8_t* p;
+
+    if(!read_ahead(a, 8, &p))
+        return 0;
+
+    *pvalue = *(const uint64_t*)p;
+
+    (void) __archive_read_consume(a, 8);
+    return 1;
+}
+
 static int bid_standard(struct archive_read* a) {
     const uint8_t* p;
 
@@ -278,11 +297,141 @@ process_main_locator_extra_block(struct archive_read* a, struct rar5* rar) {
     return ARCHIVE_OK;
 }
 
+static int parse_htime_item(struct archive_read* a, char unix_time, uint64_t* where, ssize_t* extra_data_size) {
+    if(unix_time) {
+        uint32_t time_val;
+        if(!read_u32(a, &time_val))
+            return ARCHIVE_EOF;
+
+        *extra_data_size -= 4;
+        *where = (uint64_t) time_val;
+    } else {
+        if(!read_u64(a, where))
+            return ARCHIVE_EOF;
+
+        *extra_data_size -= 8;
+    }
+
+    return ARCHIVE_OK;
+}
+
+static int parse_file_extra_htime(struct archive_read* a, struct rar5* rar, ssize_t* extra_data_size) {
+    char unix_time = 0;
+    uint64_t flags;
+    size_t value_len;
+
+    enum HTIME_FLAGS {
+        IS_UNIX = 1,
+        HAS_MTIME = 2,
+        HAS_CTIME = 4,
+        HAS_ATIME = 8,
+        HAS_UNKNOWN = 0x10,
+        // TODO: check this UNKNOWN entry on Windows rar.exe
+    };
+
+    if(!read_var(a, &flags, &value_len))
+        return ARCHIVE_EOF;
+
+    *extra_data_size -= value_len;
+    (void) __archive_read_consume(a, value_len);
+
+    unix_time = flags & IS_UNIX;
+
+    if(flags & HAS_MTIME)
+        parse_htime_item(a, unix_time, &rar->file.e_mtime, extra_data_size);
+
+    if(flags & HAS_CTIME)
+        parse_htime_item(a, unix_time, &rar->file.e_ctime, extra_data_size);
+
+    if(flags & HAS_ATIME)
+        parse_htime_item(a, unix_time, &rar->file.e_atime, extra_data_size);
+
+    if(flags & HAS_UNKNOWN) {
+        if(!read_u32(a, &rar->file.e_unknown))
+            return ARCHIVE_EOF;
+
+        *extra_data_size -= 4;
+    }
+
+
+    LOG("mtime: %016lx", rar->file.e_mtime);
+    LOG("ctime: %016lx", rar->file.e_ctime);
+    LOG("atime: %016lx", rar->file.e_atime);
+    return ARCHIVE_OK;
+}
+
+static int process_head_file_extra(struct archive_read* a, struct rar5* rar, ssize_t extra_data_size) {
+    uint64_t extra_field_size;
+    uint64_t extra_field_id;
+    int ret = ARCHIVE_FATAL;
+    ssize_t var_size;
+
+    enum EXTRA {
+        CRYPT = 0x01, HASH = 0x02, HTIME = 0x03, VERSION_ = 0x04, REDIR = 0x05, UOWNER = 0x06, SUBDATA = 0x07
+    };
+
+    LOG("extra_data_size before attr loop=%zi", extra_data_size);
+
+    while(extra_data_size > 0) {
+        if(!read_var(a, &extra_field_size, &var_size))
+            return ARCHIVE_EOF;
+
+        extra_data_size -= var_size;
+        (void) __archive_read_consume(a, var_size);
+
+        if(!read_var(a, &extra_field_id, &var_size))
+            return ARCHIVE_EOF;
+
+        extra_data_size -= var_size;
+        (void) __archive_read_consume(a, var_size);
+
+        LOG("extra_field_size=%d", extra_field_size);
+        LOG("extra_field_id=%d", extra_field_id);
+        LOG("extra_data_size after size/type fields=%zi", extra_data_size);
+
+        switch(extra_field_id) {
+            case CRYPT:
+                LOG("CRYPT");
+                break;
+            case HASH:
+                LOG("HASH");
+                break;
+            case HTIME:
+                ret = parse_file_extra_htime(a, rar, &extra_data_size); break;
+                break;
+            case VERSION_:
+                LOG("VERSION");
+                break;
+            case REDIR:
+                LOG("REDIR");
+                break;
+            case UOWNER:
+                LOG("UOWNER");
+                break;
+            case SUBDATA:
+                LOG("SUBDATA");
+                break;
+            default:
+                LOG("*** fatal: unknown extra field in a file/service block: %d", extra_field_id);
+                return ARCHIVE_FATAL;
+        }
+
+        LOG("extra_data_size after parsing attr: %zi", extra_data_size);
+    }
+
+    if(ret != ARCHIVE_OK) {
+        LOG("*** attribute parsing failed: attr not implemented maybe?");
+        return ret;
+    }
+
+    return ARCHIVE_OK;
+}
+
 static int process_head_file(struct archive_read* a, struct rar5* rar, struct archive_entry* entry, size_t block_flags) {
     UNUSED(rar);
 
-    size_t extra_data_size = 0, data_size, file_flags, unpacked_size,
-        file_attr, compression_info, host_os, name_size;
+    ssize_t extra_data_size = 0;
+    size_t data_size, file_flags, unpacked_size, file_attr, compression_info, host_os, name_size;
     uint32_t mtime = 0, crc;
     int c_method = 0, c_version = 0, is_dir;
     char name_utf8_buf[2048 * 4];
@@ -294,28 +443,9 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
     reset_file_context(rar);
 
     if(block_flags & HFL_EXTRA_DATA) {
+        LOG("extra data is present here");
         if(!read_var(a, &extra_data_size, NULL))
             return ARCHIVE_EOF;
-
-        ssize_t data_size = (ssize_t) extra_data_size;
-        if(data_size < 0) {
-            LOG("extra data is negative, *** not supported yet");
-            return ARCHIVE_FATAL;
-        }
-
-        enum FILE_EXTRA {
-            CRYPT = 0x01,     // encryption parameters
-            HASH = 0x02,      // blake2 hash
-            HTIME = 0x03,     // high precision file time
-            FE_VERSION = 0x04,   // file version, FE_ prefix added to prevent macro name collision
-            REDIR = 0x05,     // filesystem redirection object
-            UOWNER = 0x06,    // unix permissions
-            SUBDATA = 0x07    // service header subdata
-        };
-
-        LOG("process_head_file: has extra data, size: 0x%08zx bytes", extra_data_size);
-        LOG("*** not supported yet");
-        return ARCHIVE_FATAL;
     }
 
     if(block_flags & HFL_DATA) {
@@ -405,21 +535,16 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
     LOG("name: %s, dir? %d", name_utf8_buf, is_dir);
 
     if(extra_data_size > 0) {
-        size_t extra_field_size;
-        size_t extra_field_id;
+        int ret = process_head_file_extra(a, rar, extra_data_size);
 
-        enum EXTRA {
-            CRYPT = 0x01, HASH = 0x02, HTIME = 0x03, VERSION_ = 0x04, REDIR = 0x05, UOWNER = 0x06, SUBDATA = 0x07
-        };
+        // sanity check
+        if(extra_data_size < 0) {
+            LOG("*** internal error, file extra data size is not zero, parse error?");
+            return ARCHIVE_FATAL;
+        }
 
-        if(!read_var(a, &extra_field_size, NULL))
-            return ARCHIVE_EOF;
-
-        if(!read_var(a, &extra_field_id, NULL))
-            return ARCHIVE_EOF;
-
-        LOG("*** EXTRA in file/service block, not supported yet");
-        return ARCHIVE_FAILED;
+        if(ret != ARCHIVE_OK)
+            return ret;
     }
 
     memset(entry, 0, sizeof(struct archive_entry));
@@ -690,10 +815,8 @@ static int do_unstore_file(struct archive_read* a,
     const uint8_t* p;
 
     (void) __archive_read_consume(a, rar->file.prev_read_bytes);
-
-    LOG("unstoring file, remaining bytes: 0x%lx", rar->file.bytes_remaining);
-
     size_t to_read = RAR5_MIN(rar->file.bytes_remaining, a->archive.read_data_requested);
+
     if(!read_ahead(a, to_read, &p)) {
         LOG("I/O error during do_unstore_file");
         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT, "I/O error when unstoring file");
@@ -701,7 +824,7 @@ static int do_unstore_file(struct archive_read* a,
     }
 
     *buf = p;
-    *size = rar->file.bytes_remaining;
+    *size = to_read;
     *offset = rar->file.read_offset;
 
     rar->file.prev_read_bytes = to_read;
@@ -717,10 +840,8 @@ static int do_unpack(struct archive_read* a,
                      size_t* size, 
                      int64_t* offset) 
 {
-    LOG("do_unpack, compression method: %d", rar->compression.method);
-
     if(is_solid(rar)) {
-        LOG("TODO: solid archives are not supported yet");
+        LOG("TODO: *** solid archives are not supported yet");
         return ARCHIVE_FATAL;
     }
 
@@ -766,8 +887,6 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
         }
     }
 
-    LOG("ask for data: %zu", a->archive.read_data_requested);
-
     int ret = do_unpack(a, rar, buff, size, offset);
     if(ret != ARCHIVE_OK) {
         LOG("do_unpack returned error: %d", ret);
@@ -800,8 +919,10 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
             archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
                               "File CRC error");
             return ARCHIVE_FATAL;
-        } else {
+        } else if(!check_crc) {
             LOG("warning: this entry doesn't have CRC info");
+        } else {
+            LOG("file crc ok");
         }
     }
 
