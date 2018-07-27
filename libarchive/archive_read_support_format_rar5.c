@@ -29,11 +29,15 @@ struct file_header {
     uint64_t read_offset; // offset in the compressed stream
     uint64_t prev_read_bytes;
 
-    // extra fields
+    // optional time fields
     uint64_t e_mtime;
     uint64_t e_ctime;
     uint64_t e_atime;
     uint32_t e_unknown;
+
+    // optional hash fields
+    uint8_t blake2sp[32];
+    char has_blake2;
 };
 
 enum BLOCK_TYPE {
@@ -93,7 +97,7 @@ static void rar5_init(struct rar5* rar) {
     memset(rar, 0, sizeof(struct rar5));
 }
 
-void reset_file_context(struct rar5* rar) {
+static void reset_file_context(struct rar5* rar) {
     memset(&rar->file, 0, sizeof(rar->file));
 }
 
@@ -109,9 +113,9 @@ static int is_solid(struct rar5* rar) {
     return rar->compression.flags & CIF_SOLID;
 }
 
-static int is_tables_read(struct rar5* rar) {
-    return rar->compression.flags & CIF_TABLES_READ;
-}
+/*static int is_tables_read(struct rar5* rar) {*/
+    /*return rar->compression.flags & CIF_TABLES_READ;*/
+/*}*/
 
 #define UNUSED(x) (void) (x)
 #define LOG(...)  do { printf(__VA_ARGS__); puts(""); } while(0)
@@ -296,6 +300,41 @@ process_main_locator_extra_block(struct archive_read* a, struct rar5* rar) {
 
     return ARCHIVE_OK;
 }
+                
+static int parse_file_extra_hash(struct archive_read* a, struct rar5* rar, ssize_t* extra_data_size) {
+    uint64_t hash_type;
+    size_t value_len;
+
+    if(!read_var(a, &hash_type, &value_len))
+        return ARCHIVE_EOF;
+
+    *extra_data_size -= value_len;
+    (void) __archive_read_consume(a, value_len);
+
+    enum HASH_TYPE {
+        BLAKE2sp = 0x00
+    };
+
+    if(hash_type == BLAKE2sp) {
+        const uint8_t* p;
+        const int hash_size = sizeof(rar->file.blake2sp);
+
+        rar->file.has_blake2 = 1;
+        if(!read_ahead(a, hash_size, &p))
+            return ARCHIVE_EOF;
+
+        memcpy(&rar->file.blake2sp, p, hash_size);
+
+        (void) __archive_read_consume(a, hash_size);
+        *extra_data_size -= hash_size;
+    } else {
+        LOG("*** error: unknown hash type: 0x%02x", (int) hash_type);
+        // TODO: set last error for all ARCHIVE_FATAL error codes across this file.
+        return ARCHIVE_FATAL;
+    }
+
+    return ARCHIVE_OK;
+}
 
 static int parse_htime_item(struct archive_read* a, char unix_time, uint64_t* where, ssize_t* extra_data_size) {
     if(unix_time) {
@@ -364,7 +403,7 @@ static int process_head_file_extra(struct archive_read* a, struct rar5* rar, ssi
     uint64_t extra_field_size;
     uint64_t extra_field_id;
     int ret = ARCHIVE_FATAL;
-    ssize_t var_size;
+    size_t var_size;
 
     enum EXTRA {
         CRYPT = 0x01, HASH = 0x02, HTIME = 0x03, VERSION_ = 0x04, REDIR = 0x05, UOWNER = 0x06, SUBDATA = 0x07
@@ -385,8 +424,8 @@ static int process_head_file_extra(struct archive_read* a, struct rar5* rar, ssi
         extra_data_size -= var_size;
         (void) __archive_read_consume(a, var_size);
 
-        LOG("extra_field_size=%d", extra_field_size);
-        LOG("extra_field_id=%d", extra_field_id);
+        LOG("extra_field_size=%ld", extra_field_size);
+        LOG("extra_field_id=%ld", extra_field_id);
         LOG("extra_data_size after size/type fields=%zi", extra_data_size);
 
         switch(extra_field_id) {
@@ -394,7 +433,7 @@ static int process_head_file_extra(struct archive_read* a, struct rar5* rar, ssi
                 LOG("CRYPT");
                 break;
             case HASH:
-                LOG("HASH");
+                ret = parse_file_extra_hash(a, rar, &extra_data_size); break;
                 break;
             case HTIME:
                 ret = parse_file_extra_htime(a, rar, &extra_data_size); break;
@@ -412,7 +451,7 @@ static int process_head_file_extra(struct archive_read* a, struct rar5* rar, ssi
                 LOG("SUBDATA");
                 break;
             default:
-                LOG("*** fatal: unknown extra field in a file/service block: %d", extra_field_id);
+                LOG("*** fatal: unknown extra field in a file/service block: %ld", extra_field_id);
                 return ARCHIVE_FATAL;
         }
 
@@ -444,8 +483,13 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
 
     if(block_flags & HFL_EXTRA_DATA) {
         LOG("extra data is present here");
-        if(!read_var(a, &extra_data_size, NULL))
+
+        size_t edata_size;
+        if(!read_var(a, &edata_size, NULL))
             return ARCHIVE_EOF;
+
+        // intentional type cast from unsigned to signed
+        extra_data_size = (ssize_t) edata_size;
     }
 
     if(block_flags & HFL_DATA) {
@@ -456,6 +500,9 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
         rar->file.bytes_remaining = rar->file.packed_size;
         LOG("data size: 0x%08zx", data_size);
     } else {
+        rar->file.packed_size = 0;
+        rar->file.bytes_remaining = 0;
+
         LOG("*** FILE/SERVICE block without data, failing");
         return ARCHIVE_FATAL;
     }
@@ -693,7 +740,7 @@ static int process_base_block(struct archive_read* a, struct rar5* rar, struct a
         HEAD_CRYPT = 0x04, HEAD_ENDARC = 0x05, HEAD_UNKNOWN = 0xff,
     };
 
-    LOG("header_id=%02x", header_id);
+    LOG("header_id=%02lx", header_id);
     switch(header_id) {
         case HEAD_MAIN:
             ret = process_head_main(a, rar, entry, header_flags);
@@ -773,23 +820,11 @@ static void bit_init(struct bit_reader* bits) {
     bits->in_addr = 0;
 }
 
-static void bit_fill(struct bit_reader* bits, struct archive_read* a, size_t size) {
-    const uint8_t* buf;
-    read_ahead(a, size, &buf); // TODO: check success
-    memcpy(bits->buf, buf, size);
-}
-
-static void bit_skip(int n) {
-    UNUSED(n);
-}
-
-static uint16_t bit_get16() {
-    return 0;
-}
-
-static uint32_t bit_get32() {
-    return 0;
-}
+/*static void bit_fill(struct bit_reader* bits, struct archive_read* a, size_t size) {*/
+    /*const uint8_t* buf;*/
+    /*read_ahead(a, size, &buf); // TODO: check success*/
+    /*memcpy(bits->buf, buf, size);*/
+/*}*/
 
 static void init_unpack(struct rar5* rar) {
     rar->file.calculated_crc32 = 0;
@@ -802,7 +837,7 @@ static void init_unpack(struct rar5* rar) {
     bit_init(&rar->bits);
 }
 
-void update_crc(struct rar5* rar, const uint8_t* p, size_t to_read) {
+static void update_crc(struct rar5* rar, const uint8_t* p, size_t to_read) {
     rar->file.calculated_crc32 = crc32(rar->file.calculated_crc32, p, to_read);
 }
 
@@ -873,9 +908,6 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
     UNUSED(size);
     UNUSED(offset);
 
-    size_t bytes_requested = a->archive.read_data_requested > g_unpack_buf_chunk_size ?
-                             g_unpack_buf_chunk_size : a->archive.read_data_requested;
-
     struct rar5* rar = get_context(a);
     if(rar->unpack_buf == NULL) {
         init_unpack(rar);
@@ -899,8 +931,8 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
         // Sanity check.
         if(rar->file.read_offset > rar->file.packed_size) {
             LOG("something is wrong: offset is bigger than packed size");
-            LOG("read_offset=0x%08x", rar->file.read_offset);
-            LOG("packed_size=0x%08x", rar->file.packed_size);
+            LOG("read_offset=0x%08lx", rar->file.read_offset);
+            LOG("packed_size=0x%08lx", rar->file.packed_size);
             return ARCHIVE_FATAL;
         }
 
