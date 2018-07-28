@@ -91,6 +91,21 @@ struct rar5 {
     struct bit_reader bits;
 };
 
+struct compressed_block_header { 
+    union {
+        struct {
+            uint8_t bit_size : 3;
+            uint8_t byte_count : 2;
+            uint8_t _ : 1;
+            uint8_t is_last_block : 1;
+            uint8_t is_table_present : 1;
+        } block_flags;
+        uint8_t block_flags_u8;
+    };
+
+    uint8_t block_cksum;
+};
+
 #define RAR5_MIN(a, b) (((a) > (b)) ? (b) : (a))
 
 static void rar5_init(struct rar5* rar) {
@@ -550,7 +565,7 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
 
     rar->compression.window_size = is_dir ? 0 : g_unpack_window_size << ((compression_info >> 10) & 15);
     rar->compression.method = c_method;
-    rar->compression.version = c_version;
+    rar->compression.version = c_version + 50;
 
     set_solid(rar, (int) (compression_info & SOLID));
 
@@ -840,6 +855,131 @@ static void update_crc(struct rar5* rar, const uint8_t* p, size_t to_read) {
     rar->file.calculated_crc32 = crc32(rar->file.calculated_crc32, p, to_read);
 }
 
+static int parse_tables(struct archive_read* a, 
+    struct rar5* rar,
+    const struct compressed_block_header* hdr)
+{
+    UNUSED(rar);
+    UNUSED(hdr);
+
+    const uint8_t* p;
+
+    if(!read_ahead(a, HUFF_BC, &p))
+        return ARCHIVE_EOF;
+
+    int bit_length[HUFF_BC];
+    UNUSED(bit_length);
+
+    uint8_t nibble_mask = 0xF0;
+    uint8_t nibble_shift = 4;
+    int value;
+    for(int i = 0; i < HUFF_BC;) {
+        LOG("p[i]=0x%02x, mask=0x%02x, shift=%d", p[i], nibble_mask, nibble_shift);
+        value = (p[i] & nibble_mask) >> nibble_shift;
+        if(nibble_mask == 0x0F)
+            ++i;
+
+        LOG("value: 0x%02x", value);
+
+        nibble_mask ^= 0xFF;
+        nibble_shift ^= 4;
+    }
+
+    return ARCHIVE_OK;
+}
+
+static const struct compressed_block_header* parse_block_header(const uint8_t* p, 
+    ssize_t* block_size) 
+{
+    const struct compressed_block_header* hdr = (const struct compressed_block_header*) p;
+    if(hdr->block_flags.byte_count == 3)
+        return NULL;
+
+    // This should probably use bit reader interface in order to be more
+    // future-proof.
+    *block_size = 0;
+    switch(hdr->block_flags.byte_count) {
+        // 2-byte block size
+        case 1: *block_size = *(const uint16_t*) &p[2]; break;
+        // 3-byte block size
+        case 2: *block_size = *(const uint32_t*) &p[2]; *block_size &= 0x00FFFFFF; break;
+        default:
+            LOG("*** todo: unsupported block size: %d", hdr->block_flags.byte_count);
+            return NULL;
+    }
+
+    uint8_t calculated_cksum = 0x5A
+                               ^ hdr->block_flags_u8
+                               ^ *block_size
+                               ^ (*block_size >> 8)
+                               ^ (*block_size >> 16);
+
+    if(calculated_cksum != hdr->block_cksum) {
+        LOG("Checksum error in compressed data block header, file corrupted?");
+        return NULL;
+    }
+
+    return hdr;
+}
+
+static int do_uncompress_file(struct archive_read* a,
+                           struct rar5* rar,
+                           const void** buf,
+                           size_t* size,
+                           int64_t* offset) 
+{
+    UNUSED(buf);
+    UNUSED(size);
+    UNUSED(offset);
+
+    const uint8_t* p;
+
+    if(rar->compression.version != 50) {
+        LOG("compression version not supported: %d", rar->compression.version);
+        return ARCHIVE_FATAL;
+    }
+
+    if(is_solid(rar)) {
+        LOG("*** TODO: solid archives are not supported yet");
+        return ARCHIVE_FATAL;
+    }
+
+    if(rar->unpack_buf == NULL) {
+        init_unpack(rar);
+        rar->unpack_buf = malloc(g_unpack_buf_chunk_size);
+        LOG("allocated unpack_buf=%p, size=%zi", (void*) rar->unpack_buf,
+                                                g_unpack_buf_chunk_size);
+        if(!rar->unpack_buf) {
+            archive_set_error(&a->archive, ENOMEM, "Can't allocate decompression buffer");
+            return ARCHIVE_FATAL;
+        }
+    }
+
+    size_t to_read = RAR5_MIN(rar->file.bytes_remaining, a->archive.read_data_requested);
+    if(!read_ahead(a, to_read, &p))
+        return ARCHIVE_EOF;
+
+    ssize_t block_size;
+    const struct compressed_block_header* hdr = parse_block_header(p, &block_size);
+    if(!hdr) {
+        LOG("*** hdr == NULL");
+        return ARCHIVE_FATAL;
+    }
+
+    (void) __archive_read_consume(a, block_size + 2);
+
+    if(hdr->block_flags.is_table_present) {
+        int ret = parse_tables(a, rar, hdr);
+        if(ret != ARCHIVE_OK) {
+            LOG("parse_tables fail");
+            return ret;
+        }
+    }
+
+    LOG("OK");
+    return ARCHIVE_FATAL;
+}
+
 static int do_unstore_file(struct archive_read* a, 
                            struct rar5* rar,
                            const void** buf,
@@ -889,9 +1029,18 @@ static int do_unpack(struct archive_read* a,
         STORE = 0, FASTEST = 1, FAST = 2, NORMAL = 3, GOOD = 4, BEST = 5
     };
 
+    LOG("compression method.version: %d.%d", rar->compression.method,
+                                             rar->compression.version);
+
     switch(rar->compression.method) {
         case STORE:
             return do_unstore_file(a, rar, buf, size, offset);
+        case FASTEST:
+            return do_uncompress_file(a, rar, buf, size, offset);
+        case FAST:
+        case NORMAL:
+        case GOOD:
+        case BEST:
         default:
             LOG("TODO: compression method not supported yet: %d", rar->compression.method);
             return ARCHIVE_FATAL;
@@ -908,15 +1057,6 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
     UNUSED(offset);
 
     struct rar5* rar = get_context(a);
-    if(rar->unpack_buf == NULL) {
-        init_unpack(rar);
-        rar->unpack_buf = malloc(g_unpack_buf_chunk_size);
-        LOG("allocated unpack_buf=%p", (void*) rar->unpack_buf);
-        if(!rar->unpack_buf) {
-            archive_set_error(&a->archive, ENOMEM, "Can't allocate decompression buffer");
-            return ARCHIVE_FATAL;
-        }
-    }
 
     int ret = do_unpack(a, rar, buff, size, offset);
     if(ret != ARCHIVE_OK) {
@@ -924,6 +1064,7 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
         return ret;
     }
 
+    // TODO: move this if into `finish_file` or something similar
     if(rar->file.bytes_remaining == 0) {
         // Fully unpacked the file.
         //
