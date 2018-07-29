@@ -341,7 +341,7 @@ static int rar_br_preparation(struct archive_read *, struct rar_br *);
 static int parse_codes(struct archive_read *);
 static void free_codes(struct archive_read *);
 static int read_next_symbol(struct archive_read *, struct huffman_code *);
-int create_code(struct archive_read *, struct huffman_code *,
+static int create_code(struct archive_read *, struct huffman_code *,
                         unsigned char *, int, char);
 static int add_value(struct archive_read *, struct huffman_code *, int, int,
                      int);
@@ -395,7 +395,7 @@ static const uint32_t cache_masks[] = {
  * Returns 1 if the cache buffer is full.
  * Returns 0 if the cache buffer is not full; input buffer is empty.
  */
-static int
+int
 rar_br_fillup(struct archive_read *a, struct rar_br *br)
 {
   struct rar *rar = (struct rar *)(a->format->data);
@@ -490,7 +490,7 @@ rar_br_fillup(struct archive_read *a, struct rar_br *br)
   }
 }
 
-static int
+int
 rar_br_preparation(struct archive_read *a, struct rar_br *br)
 {
   struct rar *rar = (struct rar *)(a->format->data);
@@ -2340,7 +2340,7 @@ free_codes(struct archive_read *a)
 }
 
 
-static int
+int
 read_next_symbol(struct archive_read *a, struct huffman_code *code)
 {
   unsigned char bit;
