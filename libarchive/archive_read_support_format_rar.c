@@ -341,7 +341,7 @@ static int rar_br_preparation(struct archive_read *, struct rar_br *);
 static int parse_codes(struct archive_read *);
 static void free_codes(struct archive_read *);
 static int read_next_symbol(struct archive_read *, struct huffman_code *);
-static int create_code(struct archive_read *, struct huffman_code *,
+int create_code(struct archive_read *, struct huffman_code *,
                         unsigned char *, int, char);
 static int add_value(struct archive_read *, struct huffman_code *, int, int,
                      int);
@@ -2412,7 +2412,7 @@ read_next_symbol(struct archive_read *a, struct huffman_code *code)
   return code->tree[node].branches[0];
 }
 
-static int
+int
 create_code(struct archive_read *a, struct huffman_code *code,
             unsigned char *lengths, int numsymbols, char maxlength)
 {

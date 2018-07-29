@@ -20,6 +20,31 @@
 
 static int rar5_read_data_skip(struct archive_read *a);
 
+// common with rar4
+struct huffman_tree_node
+{
+  int branches[2];
+};
+
+struct huffman_table_entry
+{
+  unsigned int length;
+  int value;
+};
+
+struct huffman_code
+{
+  struct huffman_tree_node *tree;
+  int numentries;
+  int numallocatedentries;
+  int minlength;
+  int maxlength;
+  int tablesize;
+  struct huffman_table_entry *table;
+};
+int create_code(struct archive_read *, struct huffman_code *, unsigned char *, int, char);
+// end common with rar4
+
 struct file_header {
     uint32_t stored_crc32;
     uint32_t calculated_crc32;
@@ -52,7 +77,19 @@ enum BLOCK_TYPE {
 #define HUFF_TABLE_SIZE (HUFF_NC + HUFF_DC + HUFF_RC + HUFF_LDC)
 
 static const int CIF_SOLID       = 0x00000001;
-static const int CIF_TABLES_READ = 0x00000002;
+/*static const int CIF_TABLES_READ = 0x00000002;*/
+
+#define MAX_QUICK_DECODE_BITS 10
+
+struct decode_table {
+    uint32_t size;
+    uint32_t decode_len[16];
+    uint32_t decode_pos[16];
+    uint32_t quick_bits;
+    uint8_t quick_len[1 << MAX_QUICK_DECODE_BITS];
+    uint16_t quick_num[1 << MAX_QUICK_DECODE_BITS];
+    uint16_t decode_num[306];
+};
 
 struct comp_info {
     int flags;
@@ -63,12 +100,10 @@ struct comp_info {
     size_t window_offset;
     size_t window_mask;
 
-    int tables_read;
-    uint8_t huffman_table[HUFF_TABLE_SIZE];
-    enum BLOCK_TYPE block_type;
+    struct huffman_code bd;
 };
 
-static const int BIT_READER_MAX_BUF = 0x8000;
+/*static const int BIT_READER_MAX_BUF = 0x8000;*/
 
 struct bit_reader {
     uint8_t* buf;
@@ -120,9 +155,9 @@ static void set_solid(struct rar5* rar, int flag) {
     rar->compression.flags |= flag ? CIF_SOLID : 0;
 }
 
-static void set_tables_read(struct rar5* rar, int flag) {
-    rar->compression.flags |= flag ? CIF_TABLES_READ : 0;
-}
+/*static void set_tables_read(struct rar5* rar, int flag) {*/
+    /*rar->compression.flags |= flag ? CIF_TABLES_READ : 0;*/
+/*}*/
 
 static int is_solid(struct rar5* rar) {
     return rar->compression.flags & CIF_SOLID;
@@ -824,15 +859,15 @@ rar5_read_header(struct archive_read *a, struct archive_entry *entry)
     return ret;
 }
 
-static void bit_init(struct bit_reader* bits) {
-    if(bits->buf)
-        free(bits->buf);
+/*static void bit_init(struct bit_reader* bits) {*/
+    /*if(bits->buf)*/
+        /*free(bits->buf);*/
 
-    bits->buf = malloc(3 + BIT_READER_MAX_BUF); // TODO: verify null pointer
-    memset(bits->buf, 0, 3 + BIT_READER_MAX_BUF);
-    bits->bit_addr = 0;
-    bits->in_addr = 0;
-}
+    /*bits->buf = malloc(3 + BIT_READER_MAX_BUF); // TODO: verify null pointer*/
+    /*memset(bits->buf, 0, 3 + BIT_READER_MAX_BUF);*/
+    /*bits->bit_addr = 0;*/
+    /*bits->in_addr = 0;*/
+/*}*/
 
 /*static void bit_fill(struct bit_reader* bits, struct archive_read* a, size_t size) {*/
     /*const uint8_t* buf;*/
@@ -843,46 +878,74 @@ static void bit_init(struct bit_reader* bits) {
 static void init_unpack(struct rar5* rar) {
     rar->file.calculated_crc32 = 0;
     rar->file.read_offset = 0;
-
-    rar->compression.block_type = BLOCK_LZ;
     rar->compression.window_mask = rar->compression.window_size - 1;
-    memset(rar->compression.huffman_table, 0, HUFF_TABLE_SIZE);
-    set_tables_read(rar, False);
-    bit_init(&rar->bits);
 }
 
 static void update_crc(struct rar5* rar, const uint8_t* p, size_t to_read) {
     rar->file.calculated_crc32 = crc32(rar->file.calculated_crc32, p, to_read);
 }
 
+static void free_tables(struct rar5* rar) {
+    // TODO: test
+    free(rar->compression.bd.tree);
+    free(rar->compression.bd.table);
+}
+
 static int parse_tables(struct archive_read* a, 
     struct rar5* rar,
-    const struct compressed_block_header* hdr)
+    const struct compressed_block_header* hdr,
+    ssize_t block_size)
 {
     UNUSED(rar);
     UNUSED(hdr);
 
+    int ret;
     const uint8_t* p;
 
-    if(!read_ahead(a, HUFF_BC, &p))
+    if(!read_ahead(a, block_size, &p))
         return ARCHIVE_EOF;
 
-    int bit_length[HUFF_BC];
-    UNUSED(bit_length);
-
+    uint8_t bit_length[HUFF_BC];
     uint8_t nibble_mask = 0xF0;
     uint8_t nibble_shift = 4;
     int value;
-    for(int i = 0; i < HUFF_BC;) {
-        LOG("p[i]=0x%02x, mask=0x%02x, shift=%d", p[i], nibble_mask, nibble_shift);
+
+    for(int w = 0, i = 0; w < HUFF_BC;) {
         value = (p[i] & nibble_mask) >> nibble_shift;
+
         if(nibble_mask == 0x0F)
             ++i;
 
-        LOG("value: 0x%02x", value);
-
         nibble_mask ^= 0xFF;
         nibble_shift ^= 4;
+
+        if(value == 15) {
+            value = (p[i] & nibble_mask) >> nibble_shift;
+            if(nibble_mask == 0x0F)
+                ++i;
+            nibble_mask ^= 0xFF;
+            nibble_shift ^= 4;
+
+            if(value == 0) {
+                LOG("store %d %02x", w, 15);
+                bit_length[w++] = 15;
+            } else {
+                for(int k = 0; k < value; k++) {
+                    LOG("store %d %02x", w, 0);
+                    bit_length[w++] = 0;
+                }
+            }
+        } else {
+            LOG("store %d %02x", w, value);
+            bit_length[w++] = value;
+        }
+    }
+
+    ret = create_code(a, &rar->compression.bd, bit_length, HUFF_BC, 15);
+    if(ret != ARCHIVE_OK) {
+        LOG("create_code for BC failed");
+        free_tables(rar);
+        return ret;
     }
 
     return ARCHIVE_OK;
@@ -966,10 +1029,10 @@ static int do_uncompress_file(struct archive_read* a,
         return ARCHIVE_FATAL;
     }
 
-    (void) __archive_read_consume(a, block_size + 2);
+    (void) __archive_read_consume(a, hdr->block_flags.byte_count + 3);
 
     if(hdr->block_flags.is_table_present) {
-        int ret = parse_tables(a, rar, hdr);
+        int ret = parse_tables(a, rar, hdr, block_size);
         if(ret != ARCHIVE_OK) {
             LOG("parse_tables fail");
             return ret;
