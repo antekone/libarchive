@@ -83,7 +83,7 @@ static const int CIF_SOLID       = 0x00000001;
 
 struct decode_table {
     uint32_t size;
-    uint32_t decode_len[16];
+    int32_t decode_len[16];
     uint32_t decode_pos[16];
     uint32_t quick_bits;
     uint8_t quick_len[1 << MAX_QUICK_DECODE_BITS];
@@ -100,14 +100,16 @@ struct comp_info {
     size_t window_offset;
     size_t window_mask;
 
-    struct huffman_code bd;
+    struct decode_table bd;
+    struct decode_table ld;
+    struct decode_table dd;
+    struct decode_table ldd;
+    struct decode_table rd;
 };
 
 /*static const int BIT_READER_MAX_BUF = 0x8000;*/
 
 struct bit_reader {
-    uint8_t* buf;
-    int buf_size;
     int bit_addr;
     int in_addr;
 };
@@ -231,8 +233,35 @@ static int read_var(struct archive_read* a, uint64_t* pvalue, size_t* pvalue_len
     return 0;
 }
 
-int read_u32(struct archive_read* a, uint32_t* pvalue);
-int read_u32(struct archive_read* a, uint32_t* pvalue) {
+/*static int read_u16(struct archive_read* a, uint16_t* pvalue) {*/
+    /*const uint8_t* p;*/
+
+    /*if(!read_ahead(a, 2, &p))*/
+        /*return 0;*/
+
+    /**pvalue = *(const uint16_t*)p;*/
+
+    /*(void) __archive_read_consume(a, 2);*/
+    /*return 1;*/
+/*}*/
+
+static int read_bits_16(struct rar5* rar, const uint8_t* p, uint16_t* value) {
+    int bits = (int) p[rar->bits.in_addr] << 16;
+    LOG("addr=%d, bit=%d", 4 + rar->bits.in_addr, rar->bits.bit_addr);
+    bits |= (int) p[rar->bits.in_addr + 1] << 8;
+    bits |= (int) p[rar->bits.in_addr + 2];
+    bits >>= (8 - rar->bits.bit_addr);
+    *value = bits & 0xffff;
+    return ARCHIVE_OK;
+}
+
+static void skip_bits(struct rar5* rar, int bits) {
+    int new_bits = rar->bits.bit_addr + bits;
+    rar->bits.in_addr += new_bits >> 3;
+    rar->bits.bit_addr = new_bits & 7;
+}
+
+static int read_u32(struct archive_read* a, uint32_t* pvalue) {
     const uint8_t* p;
 
     if(!read_ahead(a, 4, &p))
@@ -885,10 +914,142 @@ static void update_crc(struct rar5* rar, const uint8_t* p, size_t to_read) {
     rar->file.calculated_crc32 = crc32(rar->file.calculated_crc32, p, to_read);
 }
 
-static void free_tables(struct rar5* rar) {
-    // TODO: test
-    free(rar->compression.bd.tree);
-    free(rar->compression.bd.table);
+#define countof(X) ((const ssize_t) (sizeof(X) / sizeof(*X)))
+
+static void dump_decode_table(struct decode_table* t) {
+    LOG("[decodetable] size: %d", t->size);
+
+    LOG("[decodetable] decode_len: ");
+    for(int i = 0; i < 16; i++) {
+        printf("%04x, ", t->decode_len[i]);
+    }
+    printf("\n");
+
+    LOG("[decodetable] decode_pos: ");
+    for(int i = 0; i < 16; i++) {
+        printf("%04x, ", t->decode_pos[i]);
+    }
+    printf("\n");
+
+    LOG("[decodetable] quick_bits: %d", t->quick_bits);
+
+    LOG("[decodetable] quick_len: ");
+    for(int i = 0; i < (1 << 10); i++) {
+        printf("%04x, ", t->quick_len[i]);
+    }
+    printf("\n");
+
+    LOG("[decodetable] quick_num: ");
+    for(int i = 0; i < (1 << 10); i++) {
+        printf("%04x, ", t->quick_num[i]);
+    }
+    printf("\n");
+
+    LOG("[decodetable] decode_num: ");
+    for(int i = 0; i < 306; i++) {
+        printf("%04x, ", t->decode_num[i]);
+    }
+    printf("\n");
+
+}
+
+static int create_decode_tables(uint8_t* bit_length, struct decode_table* table, int size) {
+    int lc[16];
+    uint32_t decode_pos_clone[countof(table->decode_pos)];
+    int upper_limit = 0;
+
+    memset(&lc, 0, sizeof(lc));
+    memset(table->decode_num, 0, sizeof(table->decode_num));
+    table->size = size;
+    table->quick_bits = size == HUFF_NC ? 10 : 7;
+
+    for(int i = 0; i < size; i++) {
+        lc[bit_length[i] & 15]++;
+    }
+    
+    lc[0] = 0;
+    table->decode_pos[0] = 0;
+    table->decode_len[0] = 0;
+
+    for(int i = 1; i < 16; i++) {
+        upper_limit += lc[i];
+
+        table->decode_len[i] = upper_limit << (16 - i);
+        table->decode_pos[i] = table->decode_pos[i - 1] + lc[i - 1];
+
+        upper_limit <<= 1;
+    }
+
+    memcpy(decode_pos_clone, table->decode_pos, sizeof(decode_pos_clone));
+
+    for(int i = 0; i < size; i++) {
+        uint8_t cur_len = bit_length[i] & 15;
+        if(cur_len > 0) {
+            int last_pos = decode_pos_clone[cur_len];
+            table->decode_num[last_pos] = i;
+            decode_pos_clone[cur_len]++;
+        }
+    }
+
+    ssize_t quick_data_size = 1 << table->quick_bits;
+    ssize_t cur_len = 1;
+    for(int code = 0; code < quick_data_size; code++) {
+        int bit_field = code << (16 - table->quick_bits);
+        int dist, pos;
+
+        while(cur_len < countof(table->decode_len) && bit_field >= table->decode_len[cur_len])
+            cur_len++;
+
+        table->quick_len[code] = cur_len;
+
+        dist = bit_field - table->decode_len[cur_len - 1];
+        dist >>= (16 - cur_len);
+
+        pos = table->decode_pos[cur_len] + dist;
+        if(cur_len < countof(table->decode_pos) && pos < size) {
+            table->quick_num[code] = table->decode_num[pos];
+        } else {
+            table->quick_num[code] = 0;
+        }
+    }
+
+    return ARCHIVE_OK;
+}
+
+static int decode_number(struct archive_read* a, struct rar5* rar,
+    struct decode_table* table, const uint8_t* p, uint16_t* num)
+{
+    UNUSED(a);
+
+    uint16_t bitfield;
+    if(ARCHIVE_OK != read_bits_16(rar, p, &bitfield)) {
+        LOG("read_bits_16 fail");
+        return ARCHIVE_EOF;
+    }
+
+    bitfield &= 0xfffe;
+    LOG("bitfield: 0x%04x", bitfield);
+    
+    if(bitfield < table->decode_len[table->quick_bits]) {
+        LOG("using cached value");
+        int code = bitfield >> (16 - table->quick_bits);
+        LOG("move fwd by %d bits", table->quick_len[code]);
+        skip_bits(rar, table->quick_len[code]);
+        *num = table->quick_num[code];
+        return ARCHIVE_OK;
+    }
+
+    int bits = 15;
+    UNUSED(bits);
+    for(int i = table->quick_bits + 1; i < 15; i++) {
+        if(bitfield < table->decode_len[i]) {
+            bits = i;
+            break;
+        }
+    }
+
+    LOG("*** decode_number TODO");
+    return ARCHIVE_FATAL;
 }
 
 static int parse_tables(struct archive_read* a, 
@@ -908,9 +1069,9 @@ static int parse_tables(struct archive_read* a,
     uint8_t bit_length[HUFF_BC];
     uint8_t nibble_mask = 0xF0;
     uint8_t nibble_shift = 4;
-    int value;
+    int value, i, w;
 
-    for(int w = 0, i = 0; w < HUFF_BC;) {
+    for(w = 0, i = 0; w < HUFF_BC;) {
         value = (p[i] & nibble_mask) >> nibble_shift;
 
         if(nibble_mask == 0x0F)
@@ -930,7 +1091,7 @@ static int parse_tables(struct archive_read* a,
                 LOG("store %d %02x", w, 15);
                 bit_length[w++] = 15;
             } else {
-                for(int k = 0; k < value; k++) {
+                for(int k = 0; k < value + 2; k++) {
                     LOG("store %d %02x", w, 0);
                     bit_length[w++] = 0;
                 }
@@ -941,11 +1102,109 @@ static int parse_tables(struct archive_read* a,
         }
     }
 
-    ret = create_code(a, &rar->compression.bd, bit_length, HUFF_BC, 15);
+    (void) __archive_read_consume(a, i);
+    rar->bits.in_addr = i;
+
+    ret = create_decode_tables(bit_length, &rar->compression.bd, HUFF_BC);
     if(ret != ARCHIVE_OK) {
-        LOG("create_code for BC failed");
-        free_tables(rar);
-        return ret;
+        LOG("create_decode_tables #1 fail");
+        return ARCHIVE_FATAL;
+    }
+
+    dump_decode_table(&rar->compression.bd);
+
+    uint8_t table[HUFF_TABLE_SIZE];
+    UNUSED(table);
+
+    LOG("building table");
+    for(i = 0; i < HUFF_TABLE_SIZE;) {
+        uint16_t num;
+
+        ret = decode_number(a, rar, &rar->compression.bd, p, &num);
+        if(ret != ARCHIVE_OK) {
+            LOG("decode_number fail");
+            return ARCHIVE_FATAL;
+        }
+
+        LOG("num=%d", num);
+
+        if(num < 16) {
+            // 0..15: store directly
+            table[i] = num;
+            i++;
+            continue;
+        }
+
+        if(num < 18) {
+            // 16..17: repeat previous code
+            uint16_t n;
+            if(ARCHIVE_OK != read_bits_16(rar, p, &n))
+                return ARCHIVE_EOF;
+
+            if(num == 16) {
+                n >>= 13;
+                n += 3;
+                skip_bits(rar, 3);
+            } else {
+                n >>= 9;
+                n += 11;
+                skip_bits(rar, 7);
+            }
+
+            if(i > 0) {
+                while(n-- > 0 && i < HUFF_TABLE_SIZE) {
+                    table[i] = table[i - 1];
+                    i++;
+                }
+            } else
+                return ARCHIVE_FATAL;
+
+            continue;
+        }
+
+        // other codes: fill with zeroes `n` times
+        uint16_t n;
+        if(ARCHIVE_OK != read_bits_16(rar, p, &n))
+            return ARCHIVE_EOF;
+
+        if(num == 18) {
+            n >>= 13;
+            n += 3;
+            skip_bits(rar, 3);
+        } else {
+            n >>= 9;
+            n += 11;
+            skip_bits(rar, 7);
+        }
+
+        while(n-- > 0 && i < HUFF_TABLE_SIZE)
+            table[i++] = 0;
+    }
+
+    LOG("done, table size: %d", HUFF_TABLE_SIZE);
+
+    ret = create_decode_tables(&table[0], &rar->compression.ld, HUFF_NC);
+    if(ret != ARCHIVE_OK) {
+        LOG("ld table creation fail");
+        return ARCHIVE_FATAL;
+    }
+
+    ret = create_decode_tables(&table[HUFF_NC], &rar->compression.dd, HUFF_DC);
+    if(ret != ARCHIVE_OK) {
+        LOG("dd table creation fail");
+        return ARCHIVE_FATAL;
+    }
+
+    ret = create_decode_tables(&table[HUFF_NC + HUFF_DC], &rar->compression.ldd, HUFF_LDC);
+    if(ret != ARCHIVE_OK) {
+        LOG("ldd table creation fail");
+        return ARCHIVE_FATAL;
+    }
+
+    ret = create_decode_tables(&table[HUFF_NC + HUFF_DC + HUFF_LDC], &rar->compression.rd, HUFF_RC);
+    if(ret != ARCHIVE_OK) {
+        LOG("rd table creation fail");
+        return ARCHIVE_FATAL;
     }
 
     return ARCHIVE_OK;
