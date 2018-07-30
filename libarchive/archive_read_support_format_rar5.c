@@ -181,21 +181,22 @@ static struct filter_info* add_new_filter(struct rar5* rar) {
 
 static void dist_cache_push(struct rar5* rar, int value) {
     int* q = rar->compression.dist_cache;
-    size_t len = rar5_countof(rar->compression.dist_cache);
 
-    // TODO: change this to a pointer index
-
-    memmove(&q[0], &q[4], len * sizeof(int));
-    q[len] = value;
+    q[3] = q[2];
+    q[2] = q[1];
+    q[1] = q[0];
+    q[0] = value;
 }
 
-static int dist_cache_pop(struct rar5* rar) {
+static int dist_cache_touch(struct rar5* rar, int index) {
     int* q = rar->compression.dist_cache;
-    size_t len = rar5_countof(rar->compression.dist_cache);
-    int v = q[len - 1];
-    // TODO: change this to a pointer index
-    memmove(&q[4], &q[0], len * sizeof(int) - 4);
-    return v;
+
+    int dist = q[index];
+    for(int i = index; i > 0; i--)
+        q[i] = q[i - 1];
+
+    q[0] = dist;
+    return dist;
 }
 
 static void rar5_init(struct rar5* rar) {
@@ -1390,7 +1391,7 @@ static void copy_string(struct rar5* rar, int len, int dist) {
     }
 
     // TODO: Debug
-    printf("copy bytes: ");
+    printf("copy_string len=%d, dist=%d, copy bytes: ", len, dist);
     for(int i = 0; i < len; i++) {
         printf("%02x ", src_ptr[i]);
     }
@@ -1401,17 +1402,24 @@ static void copy_string(struct rar5* rar, int len, int dist) {
     rar->compression.write_ptr += len;
 }
 
-static int uncompress_block(struct archive_read* a, struct rar5* rar, const uint8_t* p, ssize_t block_size) {
+static int uncompress_block(struct archive_read* a, 
+        struct rar5* rar, 
+        const uint8_t* p, 
+        const struct compressed_block_header* hdr, 
+        ssize_t block_size) 
+{
     UNUSED(rar);
     UNUSED(block_size);
 
     uint16_t num;
     int ret;
     int last_len;
+    int bit_size = hdr->block_flags.bit_size;
 
-    LOG("--- decompression starts");
+    LOG("--- decompression starts, block_size=%zi bytes, bit size %d bits", block_size, bit_size);
 
-    while(rar->bits.in_addr < block_size) {
+    while((rar->bits.in_addr < block_size - 1) || rar->bits.bit_addr < bit_size) {
+        LOG("--> real addr=%d/%d", rar->bits.in_addr, rar->bits.bit_addr);
         if(ARCHIVE_OK != decode_number(a, rar, &rar->compression.ld, p, &num)) {
             LOG("fail in decode_number");
             return ARCHIVE_EOF;
@@ -1426,6 +1434,10 @@ static int uncompress_block(struct archive_read* a, struct rar5* rar, const uint
         //
         // - Code 256 defines a new filter, which will be used to transform the
         // data block when it'll be fully decoded.
+        //
+        // - Code bigger than 257 and smaller than 262 define a repetition
+        // pattern that should be copied from an already uncompressed chunk
+        // of data.
         if(num < 256) {
             // Store literal directly.
             LOG("write raw: 0x%02x", num);
@@ -1523,17 +1535,37 @@ static int uncompress_block(struct archive_read* a, struct rar5* rar, const uint
 
             continue;
         } else if(num == 257) {
-            // TODO: implement this
+            if(last_len != 0) {
+                copy_string(rar, last_len, rar->compression.dist_cache[0]);
+            }
+
+            continue;
         } else if(num < 262) {
             int index = num - 258;
-            int dist = rar->compression.dist_cache[index];
-            dist_cache_pop(rar);
-            // TODO: implement
+            int dist = dist_cache_touch(rar, index);
+            uint16_t len_slot;
+            int len;
+
+            if(ARCHIVE_OK != decode_number(a, rar, &rar->compression.rd, p, &len_slot)) {
+                LOG("fail during decode_number(rd)");
+                return ARCHIVE_FATAL;
+            }
+
+            len = decode_code_length(rar, p, len_slot);
+            last_len = len;
+
+            copy_string(rar, len, dist);
+            continue;
         }
 
         LOG("*** todo: unsupported block code: %d", num);
         return ARCHIVE_FATAL;
     }
+
+    LOG("window decompression done");
+    FILE* fw = fopen("nwindow.bin", "wb");
+    fwrite(rar->compression.window_buf, 1, rar->compression.window_size, fw);
+    fclose(fw);
 
     return ARCHIVE_OK;
 }
@@ -1606,7 +1638,7 @@ static int do_uncompress_file(struct archive_read* a,
         }
     }
 
-    ret = uncompress_block(a, rar, p, block_size);
+    ret = uncompress_block(a, rar, p, hdr, block_size);
     if(ret != ARCHIVE_OK) {
         LOG("uncompress_block fail");
         return ARCHIVE_FATAL;
