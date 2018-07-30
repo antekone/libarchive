@@ -1392,13 +1392,14 @@ static void copy_string(struct rar5* rar, int len, int dist) {
 
     // TODO: Debug
     printf("copy_string len=%d, dist=%d, copy bytes: ", len, dist);
+
     for(int i = 0; i < len; i++) {
         printf("%02x ", src_ptr[i]);
+        dst_ptr[i] = src_ptr[i];
     }
+
     printf("\n");
 
-    // memcpy(3) on an overlapping region is intentional.
-    memcpy(dst_ptr, src_ptr, len);
     rar->compression.write_ptr += len;
 }
 
