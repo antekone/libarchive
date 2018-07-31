@@ -1646,7 +1646,10 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
         return ERROR_FATAL;
     }
 
+    // Skip block header.
     rar->file.bytes_remaining -= hdr->block_flags.byte_count + 3;
+
+    // Skip block data, including huffman tables, if present.
     rar->file.bytes_remaining -= block_size;
     (void) __archive_read_consume(a, block_size);
 
