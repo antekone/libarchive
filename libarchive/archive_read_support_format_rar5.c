@@ -1020,11 +1020,40 @@ static void init_unpack(struct rar5* rar) {
     memset(&rar->compression.rd, 0, sizeof(rar->compression.rd));
 }
 
+static void relocate_buffers(struct rar5* rar) {
+    if(rar->compression.write_ptr > (ssize_t) (rar->compression.window_size / 2)) {
+        ssize_t old_write_ptr = rar->compression.write_ptr;
+        ssize_t new_write_ptr = rar->compression.write_ptr / 2;
+
+        const uint8_t* p = (const uint8_t*) rar->compression.window_buf + old_write_ptr;
+        LOG("last bytes: %02x %02x %02x %02x",
+                p[-4], p[-3], p[-2], p[-1]);
+
+        memcpy(rar->compression.window_buf, 
+               &rar->compression.window_buf[rar->compression.write_ptr - new_write_ptr], 
+               new_write_ptr);
+
+        const uint8_t* r = (const uint8_t*) rar->compression.window_buf + new_write_ptr;
+        LOG("last bytes: %02x %02x %02x %02x",
+                r[-4], r[-3], r[-2], r[-1]);
+
+        LOG("src: %zi", rar->compression.write_ptr - new_write_ptr);
+        LOG("old write_ptr:  %zi", rar->compression.write_ptr);
+        LOG("new write_ptr:  %zi", new_write_ptr);
+        LOG("last_write_ptr: %zi", rar->compression.last_write_ptr);
+
+        rar->compression.last_write_ptr = new_write_ptr;
+        rar->compression.write_ptr = new_write_ptr;
+        //exit(0);
+    }
+}
+
 static void update_crc(struct rar5* rar, const uint8_t* p, size_t to_read) {
     // Don't update CRC32 if the file doesn't have the `stored_crc32` info
     // filled in.
     if(rar->file.stored_crc32 > 0) {
         rar->file.calculated_crc32 = crc32(rar->file.calculated_crc32, p, to_read);
+        LOG("crc32 update, size=%zi, hash=%08x", to_read, rar->file.calculated_crc32);
     }
 }
 
@@ -1378,11 +1407,10 @@ static int parse_filter(struct rar5* rar, const uint8_t* p) {
     filt->block_start = block_start;
     filt->block_length = block_length;
 
+    // Only some filters will be processed here.
     switch(filter_type) {
-        case FILTER_DELTA: {
-            break;
-        }
-
+        case FILTER_DELTA:
+            // Pass-through
         case FILTER_AUDIO: {
             int channels;
 
@@ -1451,11 +1479,15 @@ static void copy_string(struct rar5* rar, int len, int dist) {
 
     if(src_ptr < rar->compression.window_buf) {
         LOG("fatal: src_ptr is lower than window_buf");
+        LOG("requested dist: %d", dist);
         exit(1);
     }
 
     if(dst_ptr + len > rar->compression.window_buf + rar->compression.window_size) {
         LOG("fatal: dst_ptr end is higher than end of window_buf");
+        LOG("len is %d", len);
+        LOG("dst_ptr ends in %zi", write_ptr + len);
+        LOG("src_ptr ends in %zi", rar->compression.window_size);
         exit(1);
     }
 
@@ -1481,7 +1513,7 @@ static int do_uncompress_block(struct archive_read* a,
 {
     uint16_t num;
     int ret;
-    int last_len;
+    int last_len = 0xffffffff;
     int bit_size = hdr->block_flags.bit_size;
 
     LOG("--- uncompress block, block_size=%zi bytes, bit size %d bits, write_ptr=%zu", block_size, bit_size, rar->compression.write_ptr);
@@ -1597,6 +1629,7 @@ static int do_uncompress_block(struct archive_read* a,
             //LOG("copy_string: len=%d, dist=%d", len, dist);
             dist_cache_push(rar, dist);
             last_len = len;
+            LOG("last_len <- %d", last_len);
             copy_string(rar, len, dist);
             continue;
         } else if(num == 256) {
@@ -1628,6 +1661,7 @@ static int do_uncompress_block(struct archive_read* a,
 
             len = decode_code_length(rar, p, len_slot);
             last_len = len;
+            LOG("last_len <- %d (#2)", last_len);
 
             copy_string(rar, len, dist);
             continue;
@@ -1733,6 +1767,7 @@ static int do_uncompress_file(struct archive_read* a,
     }
 
     reset_filters(rar);
+    //relocate_buffers(rar);
     ret = process_block(a, rar);
     switch(ret) {
         case ERROR_EOF:
