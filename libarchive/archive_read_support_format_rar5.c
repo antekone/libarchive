@@ -184,11 +184,22 @@ static struct filter_info* add_new_filter(struct rar5* rar) {
     return f;
 }
 
+static void run_filter(struct filter_info* flt, ssize_t offset, ssize_t len) {
+    LOG("running filter %p[%08zx-%08zx] on data block [%08zx-%08zx]", flt, 
+            (size_t) flt->block_start, 
+            (size_t) flt->block_start + flt->block_length - 1,
+            (size_t) offset,
+            (size_t) offset + len - 1);
+}
+
 static void apply_filters(struct rar5* rar, ssize_t offset, ssize_t length) {
     memcpy(rar->compression.filtered_buf + offset, rar->compression.window_buf + offset, length);
 
-    if(rar->compression.filter_count > 0) {
-        LOG("apply filters: %d", rar->compression.filter_count);
+    for(int i = 0; i < rar->compression.filter_count; ) {
+        if(rar->compression.filters[i] != NULL) {
+            run_filter(rar->compression.filters[i], offset, length);
+            i++;
+        }
     }
 }
 
@@ -216,8 +227,13 @@ static void rar5_init(struct rar5* rar) {
     memset(rar, 0, sizeof(struct rar5));
 }
 
+static void reset_filters(struct rar5* rar);
+
 static void reset_file_context(struct rar5* rar) {
     memset(&rar->file, 0, sizeof(rar->file));
+    rar->compression.write_ptr = 0;
+    rar->compression.last_write_ptr = 0;
+    reset_filters(rar);
 }
 
 static void set_solid(struct rar5* rar, int flag) {
@@ -1321,8 +1337,11 @@ static int parse_tables(struct archive_read* a,
 
 static int parse_block_header(const uint8_t* p, ssize_t* block_size, struct compressed_block_header* hdr) {
     memcpy(hdr, p, sizeof(struct compressed_block_header));
-    if(hdr->block_flags.byte_count == 3)
+    if(hdr->block_flags.byte_count == 3) {
+        LOG("block header byte_count is %d", hdr->block_flags.byte_count);
+        LOG("ptr is %02x %02x %02x %02x", p[0], p[1], p[2], p[3]);
         return ARCHIVE_FATAL;
+    }
 
     // This should probably use bit reader interface in order to be more
     // future-proof.
@@ -1357,14 +1376,12 @@ static int parse_block_header(const uint8_t* p, ssize_t* block_size, struct comp
 static int parse_filter_data(struct rar5* rar, const uint8_t* p, uint32_t* filter_data) {
     LOG("[decompress] filter encountered");
 
-    uint16_t bytes;
-    if(ARCHIVE_OK != read_bits_16(rar, p, &bytes))
+    int bytes;
+
+    if(ARCHIVE_OK != read_consume_bits(rar, p, 2, &bytes))
         return ARCHIVE_EOF;
 
-    bytes >>= 14;
     bytes++;
-
-    skip_bits(rar, 2);
 
     uint32_t data = 0;
     for(int i = 0; i < bytes; i++) {
@@ -1374,9 +1391,11 @@ static int parse_filter_data(struct rar5* rar, const uint8_t* p, uint32_t* filte
             return ARCHIVE_EOF;
         }
 
-        data = (byte >> 8) << (i * 8);
+        printf("data=%04x ", byte);
+        data += (byte >> 8) << (i * 8);
         skip_bits(rar, 8);
     }
+    printf("\n");
 
     *filter_data = data;
     return ARCHIVE_OK;
@@ -1389,17 +1408,18 @@ static int parse_filter(struct rar5* rar, const uint8_t* p) {
     if(ARCHIVE_OK != parse_filter_data(rar, p, &block_start))
         return ARCHIVE_EOF;
 
+    LOG("[filter] block_start  = 0x%08x", block_start);
+
     if(ARCHIVE_OK != parse_filter_data(rar, p, &block_length))
         return ARCHIVE_EOF;
+
+    LOG("[filter] block_length = 0x%08x", block_length);
 
     if(ARCHIVE_OK != read_bits_16(rar, p, &filter_type))
         return ARCHIVE_EOF;
 
     filter_type >>= 13;
     skip_bits(rar, 3);
-
-    LOG("[filter] block_start  = 0x%08x", block_start);
-    LOG("[filter] block_length = 0x%08x", block_length);
     LOG("[filter] filter_type  = %d", filter_type);
 
     struct filter_info* filt = add_new_filter(rar);
@@ -1629,7 +1649,7 @@ static int do_uncompress_block(struct archive_read* a,
             //LOG("copy_string: len=%d, dist=%d", len, dist);
             dist_cache_push(rar, dist);
             last_len = len;
-            LOG("last_len <- %d", last_len);
+            /*LOG("last_len <- %d", last_len);*/
             copy_string(rar, len, dist);
             continue;
         } else if(num == 256) {
@@ -1661,7 +1681,7 @@ static int do_uncompress_block(struct archive_read* a,
 
             len = decode_code_length(rar, p, len_slot);
             last_len = len;
-            LOG("last_len <- %d (#2)", last_len);
+            /*LOG("last_len <- %d (#2)", last_len);*/
 
             copy_string(rar, len, dist);
             continue;
@@ -1766,7 +1786,7 @@ static int do_uncompress_file(struct archive_read* a,
         rar->compression.initialized = 1;
     }
 
-    reset_filters(rar);
+    //reset_filters(rar);
     //relocate_buffers(rar);
     ret = process_block(a, rar);
     switch(ret) {
@@ -1782,6 +1802,8 @@ static int do_uncompress_file(struct archive_read* a,
     *buf = rar->compression.filtered_buf + rar->compression.last_write_ptr;
     *size = unpacked_block_length;
     *offset = rar->file.write_offset;
+
+    LOG("stored size=%zu / %zu", unpacked_block_length, rar->file.unpacked_size);
 
     update_crc(rar, *buf, *size);
 
@@ -1868,6 +1890,11 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
     UNUSED(offset);
 
     struct rar5* rar = get_context(a);
+
+    if(rar->file.bytes_remaining == 0) {
+        LOG("error: read data requested, but no bytes are remaining in the stream");
+        return ARCHIVE_FATAL;
+    }
 
     int ret = do_unpack(a, rar, buff, size, offset);
     if(ret != ARCHIVE_OK) {
