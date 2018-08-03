@@ -124,6 +124,7 @@ struct comp_info {
     size_t window_mask;
     ssize_t write_ptr;
     ssize_t last_write_ptr;
+    int block_num;
 
     struct decode_table bd;
     struct decode_table ld;
@@ -1401,7 +1402,7 @@ static int parse_tables(struct archive_read* a,
             table[i++] = 0;
     }
 
-    LOG("done, table size: %d", HUFF_TABLE_SIZE);
+    LOG("done, table size: %d", HUFF_TABLE_SIZE + w);
 
     ret = create_decode_tables(&table[0], &rar->compression.ld, HUFF_NC);
     if(ret != ARCHIVE_OK) {
@@ -1633,17 +1634,22 @@ static int do_uncompress_block(struct archive_read* a,
     int last_len = 0xffffffff;
     int bit_size = hdr->block_flags.bit_size;
     size_t bytes_written = rar->compression.write_ptr;
+    int codes = 0;
 
     LOG("--- uncompress block, block_size=%zi bytes, bit size %d bits, write_ptr=%zu", block_size, bit_size, rar->compression.write_ptr);
 
-    while((rar->bits.in_addr < block_size - 1) || rar->bits.bit_addr < bit_size) {
+    /*while((rar->bits.in_addr < block_size - 1) || rar->bits.bit_addr < bit_size) {*/
+    while((rar->bits.in_addr < block_size - 1)) {
         // LOG("--> real addr=%d/%d", rar->bits.in_addr, rar->bits.bit_addr);
         if(ARCHIVE_OK != decode_number(a, rar, &rar->compression.ld, p, &num)) {
             LOG("fail in decode_number");
             return ARCHIVE_EOF;
         }
+        codes++;
 
-        /*LOG("--> code=%03d", num);*/
+        if(rar->compression.write_ptr == 0x82dc6) {
+            LOG("--> code=%03d", num);
+        }
 
         // num = RARv5 command code. 
         //
@@ -1790,7 +1796,8 @@ static int do_uncompress_block(struct archive_read* a,
     }
 
     bytes_written = rar->compression.write_ptr - bytes_written;
-    LOG("window decompression done, write_ptr=%zu, bytes_written=%zu", rar->compression.write_ptr, bytes_written);
+    LOG("[%02d] window decompression done, write_ptr=%zu, bytes_written=%zu, codes=%d", rar->compression.block_num, rar->compression.write_ptr, bytes_written, codes);
+    rar->compression.block_num++;
 
     return ARCHIVE_OK;
 }
