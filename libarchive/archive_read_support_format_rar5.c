@@ -125,6 +125,7 @@ struct comp_info {
     ssize_t write_ptr;
     ssize_t last_write_ptr;
     int block_num;
+    int last_len;
 
     struct decode_table bd;
     struct decode_table ld;
@@ -239,19 +240,19 @@ static int run_e8e9_filter(struct rar5* rar, struct filter_info* flt, int extend
         if(b == 0xE8 || (extended && b == 0xE9)) {
             uint32_t addr;
 
-            LOG("found 0xE8/0xE9 on pos %x", i);
+            /*LOG("found 0xE8/0xE9 on pos %x", i);*/
             addr = read_filter_data(rar, i);
-            LOG("addr=%08x", addr);
+            /*LOG("addr=%08x", addr);*/
 
             if(addr & 0x80000000) {
                 if(((addr + i) & 0x80000000) == 0) {
                     write_filter_data(rar, i, addr + file_size);
-                    LOG("#1: stored %08x", addr + file_size);
+                    /*LOG("#1: stored %08x", addr + file_size);*/
                 }
             } else {
                 if((addr - file_size) & 0x80000000) {
                     write_filter_data(rar, i, addr - i);
-                    LOG("#2: stored %08x", addr - i);
+                    /*LOG("#2: stored %08x", addr - i);*/
                 }
             }
 
@@ -454,7 +455,7 @@ static int read_bits_32(struct rar5* rar, const uint8_t* p, uint32_t* value) {
 static int read_bits_16(struct rar5* rar, const uint8_t* p, uint16_t* value) {
     /*LOG("in=%d bit=%d", rar->bits.in_addr, rar->bits.bit_addr);*/
     int bits = (int) p[rar->bits.in_addr] << 16;
-    //LOG("addr=%d, bit=%d, raw=0x%04x", 4 + rar->bits.in_addr, rar->bits.bit_addr, p[rar->bits.in_addr]);
+    /*LOG("addr=%d, bit=%d, raw=0x%04x", 4 + rar->bits.in_addr, rar->bits.bit_addr, p[rar->bits.in_addr]);*/
     bits |= (int) p[rar->bits.in_addr + 1] << 8;
     bits |= (int) p[rar->bits.in_addr + 2];
     bits >>= (8 - rar->bits.bit_addr);
@@ -1631,25 +1632,29 @@ static int do_uncompress_block(struct archive_read* a,
 {
     uint16_t num;
     int ret;
-    int last_len = 0xffffffff;
-    int bit_size = hdr->block_flags.bit_size;
+    uint8_t bit_size = 1 + hdr->block_flags.bit_size;
     size_t bytes_written = rar->compression.write_ptr;
     int codes = 0;
 
     LOG("--- uncompress block, block_size=%zi bytes, bit size %d bits, write_ptr=%zu", block_size, bit_size, rar->compression.write_ptr);
 
-    /*while((rar->bits.in_addr < block_size - 1) || rar->bits.bit_addr < bit_size) {*/
-    while((rar->bits.in_addr < block_size - 1)) {
-        // LOG("--> real addr=%d/%d", rar->bits.in_addr, rar->bits.bit_addr);
+    while(1) {
+        if(rar->bits.in_addr > block_size - 1)
+            break;
+
+        if(rar->bits.in_addr == block_size - 1) {
+            if(rar->bits.bit_addr >= bit_size)
+                break;
+        }
+
         if(ARCHIVE_OK != decode_number(a, rar, &rar->compression.ld, p, &num)) {
             LOG("fail in decode_number");
             return ARCHIVE_EOF;
         }
+
         codes++;
 
-        if(rar->compression.write_ptr == 0x82dc6) {
-            LOG("--> code=%03d", num);
-        }
+        /*LOG("--> code=%03d", num);*/
 
         // num = RARv5 command code. 
         //
@@ -1752,7 +1757,7 @@ static int do_uncompress_block(struct archive_read* a,
 
             //LOG("copy_string: len=%d, dist=%d", len, dist);
             dist_cache_push(rar, dist);
-            last_len = len;
+            rar->compression.last_len = len;
             /*LOG("last_len <- %d", last_len);*/
             copy_string(rar, len, dist);
             continue;
@@ -1767,8 +1772,9 @@ static int do_uncompress_block(struct archive_read* a,
 
             continue;
         } else if(num == 257) {
-            if(last_len != 0) {
-                copy_string(rar, last_len, rar->compression.dist_cache[0]);
+            if(rar->compression.last_len != 0) {
+                /*LOG("CopyString %d,%d", rar->compression.last_len, rar->compression.dist_cache[0]);*/
+                copy_string(rar, rar->compression.last_len, rar->compression.dist_cache[0]);
             }
 
             continue;
@@ -1784,7 +1790,7 @@ static int do_uncompress_block(struct archive_read* a,
             }
 
             len = decode_code_length(rar, p, len_slot);
-            last_len = len;
+            rar->compression.last_len = len;
             /*LOG("last_len <- %d (#2)", last_len);*/
 
             copy_string(rar, len, dist);
@@ -1834,7 +1840,7 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
     // Read the whole block size into memory. This can take up to
     // 8 megabytes of memory in theoretical cases. Might be worth to
     // optimize this and use a standard chunk of 4kb's.
-    if(!read_ahead(a, block_size, &p))
+    if(!read_ahead(a, 1 + block_size, &p))
         return ERROR_EOF;
 
     rar->bits.in_addr = 0;
