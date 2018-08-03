@@ -846,6 +846,8 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
     rar->compression.method = c_method;
     rar->compression.version = c_version + 50;
 
+    LOG("window_size=%zu", rar->compression.window_size);
+
     set_solid(rar, (int) (compression_info & SOLID));
 
     if(!read_var(a, &host_os, NULL))
@@ -1914,8 +1916,6 @@ static int do_uncompress_file(struct archive_read* a,
 
     ssize_t unpacked_block_length = rar->compression.write_ptr - rar->compression.last_write_ptr;
 
-    update_crc(rar, rar->compression.filtered_buf, rar->compression.write_ptr);
-
     ret = apply_filters(rar, rar->compression.last_write_ptr, unpacked_block_length);
     if(ret != ARCHIVE_OK) {
         LOG("filter processing failed horribly");
@@ -1925,6 +1925,8 @@ static int do_uncompress_file(struct archive_read* a,
     *buf = rar->compression.filtered_buf;
     *size = unpacked_block_length;
     *offset = rar->file.write_offset;
+
+    update_crc(rar, rar->compression.filtered_buf, unpacked_block_length);
 
     LOG("stored size=%zu / %zu", unpacked_block_length, rar->file.unpacked_size);
     LOG("offset=%zu", rar->file.write_offset);
@@ -1991,11 +1993,11 @@ static int do_unpack(struct archive_read* a,
         case STORE:
             return do_unstore_file(a, rar, buf, size, offset);
         case FASTEST:
-            return do_uncompress_file(a, rar, buf, size, offset);
         case FAST:
         case NORMAL:
         case GOOD:
         case BEST:
+            return do_uncompress_file(a, rar, buf, size, offset);
         default:
             LOG("TODO: compression method not supported yet: %d", rar->compression.method);
             return ARCHIVE_FATAL;
