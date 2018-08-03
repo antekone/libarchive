@@ -2110,10 +2110,10 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
                     rar->file.calculated_crc32,
                     rar->file.stored_crc32);
 
-            /*archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,*/
-                              /*"File CRC error");*/
+            archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                              "File CRC error");
 
-             /*return ARCHIVE_FATAL;*/
+            return ARCHIVE_FATAL;
         } else if(!check_crc) {
             LOG("warning: this entry doesn't have CRC info");
         } else {
