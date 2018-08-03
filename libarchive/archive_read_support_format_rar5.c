@@ -18,6 +18,8 @@
 #include "archive_ppmd7_private.h"
 #include "archive_entry_private.h"
 
+//#define TURN_OFF_FILTERS
+
 static int rar5_read_data_skip(struct archive_read *a);
 
 // common with rar4
@@ -103,6 +105,7 @@ struct decode_table {
 struct filter_info {
     int type;
     int channels;
+    int id;
 
     int next_window : 1;
     int pos_r : 2;
@@ -162,8 +165,7 @@ struct compressed_block_header {
     union {
         struct {
             uint8_t bit_size : 3;
-            uint8_t byte_count : 2;
-            uint8_t _ : 1;
+            uint8_t byte_count : 3;
             uint8_t is_last_block : 1;
             uint8_t is_table_present : 1;
         } block_flags;
@@ -180,10 +182,19 @@ struct compressed_block_header {
 #define UNUSED(x) (void) (x)
 #define LOG(...)  do { printf(__VA_ARGS__); puts(""); } while(0)
 
+static void remove_filter(struct rar5* rar, size_t index) {
+    if(rar->compression.filters[index] != NULL) {
+        free(rar->compression.filters[index]);
+        rar->compression.filters[index] = NULL;
+        rar->compression.filter_count--;
+    }
+}
+
 static struct filter_info* add_new_filter(struct rar5* rar) {
     struct filter_info* f = 
         (struct filter_info*) calloc(1, sizeof(struct filter_info));
 
+    f->id = rar->compression.filter_count;
     rar->compression.filters[rar->compression.filter_count++] = f;
     return f;
 }
@@ -192,7 +203,7 @@ static int run_delta_filter(struct rar5* rar, struct filter_info* flt) {
     int i;
     uint32_t dest_pos, src_pos = 0;
 
-    LOG("run_delta_filter, channels=%d", flt->channels);
+    LOG("run_delta_filter id=%d @ 0x%08x-0x%08x, channels=%d", flt->id, flt->block_start, flt->block_start + flt->block_length, flt->channels);
     
     for(i = 0; i < flt->channels; i++) {
         uint8_t prev_byte = 0;
@@ -201,13 +212,19 @@ static int run_delta_filter(struct rar5* rar, struct filter_info* flt) {
 
             byte = rar->compression.window_buf[flt->block_start + src_pos];
             prev_byte -= byte;
+
+            if(flt->block_start + dest_pos >= rar->compression.window_size) {
+                LOG("sanity check: out of bounds write");
+                return ARCHIVE_FATAL;
+            }
+
             rar->compression.filtered_buf[flt->block_start + dest_pos] = prev_byte;
 
             /*LOG("%02d %04d/%04d Data[%d]=%02x  -> DstData[%d]=%02x", i, dest_pos, flt->block_length,*/
                     /*flt->block_start + src_pos,*/
                     /*rar->compression.window_buf[flt->block_start + src_pos],*/
                     /*dest_pos,*/
-                    /*rar->compression.filtered_buf[dest_pos]);*/
+                    /*rar->compression.filtered_buf[flt->block_start + dest_pos]);*/
 
             src_pos++;
         }
@@ -264,18 +281,33 @@ static int run_e8e9_filter(struct rar5* rar, struct filter_info* flt, int extend
 }
 
 static int run_filter(struct rar5* rar, struct filter_info* flt, ssize_t offset, ssize_t len) {
+    int ret;
+
     UNUSED(offset);
     UNUSED(len);
 
+#ifdef TURN_OFF_FILTERS
+    return ARCHIVE_OK;
+#endif
+
+    LOG("running filter");
+
     switch(flt->type) {
         case FILTER_DELTA:
-            return run_delta_filter(rar, flt);
+            ret = run_delta_filter(rar, flt);
+            break;
         case FILTER_E8:
         case FILTER_E8E9:
-            return run_e8e9_filter(rar, flt, flt->type == FILTER_E8E9);
+            ret = run_e8e9_filter(rar, flt, flt->type == FILTER_E8E9);
+            break;
         default:
             LOG("*** filter type not supported: %d", flt->type);
             return ARCHIVE_FATAL;
+    }
+
+    if(ret != ARCHIVE_OK) {
+        LOG("filter failed");
+        return ret;
     }
 
     return ARCHIVE_OK;
@@ -283,17 +315,22 @@ static int run_filter(struct rar5* rar, struct filter_info* flt, ssize_t offset,
 
 static int apply_filters(struct rar5* rar, ssize_t offset, ssize_t length) {
     int ret;
+    int invoked = 0, i = 0;
 
     memcpy(rar->compression.filtered_buf + offset, rar->compression.window_buf + offset, length);
 
-    for(int i = 0; i < rar->compression.filter_count; ) {
+    while(rar->compression.filter_count > 0) {
         if(rar->compression.filters[i] != NULL) {
             ret = run_filter(rar, rar->compression.filters[i], offset, length);
-            if(ret != ARCHIVE_OK)
+            invoked++;
+            if(ret != ARCHIVE_OK) {
+                LOG("run_filter returned something else than ARCHIVE_OK");
                 return ret;
+            }
 
-            i++;
+            remove_filter(rar, i);
         }
+        i++;
     }
 
     return ARCHIVE_OK;
@@ -1437,16 +1474,20 @@ static int parse_tables(struct archive_read* a,
 
 static int parse_block_header(const uint8_t* p, ssize_t* block_size, struct compressed_block_header* hdr) {
     memcpy(hdr, p, sizeof(struct compressed_block_header));
+    LOG("parsing block header: ptr is %02x %02x %02x %02x", p[0], p[1], p[2], p[3]);
     if(hdr->block_flags.byte_count == 3) {
         LOG("block header byte_count is %d", hdr->block_flags.byte_count);
-        LOG("ptr is %02x %02x %02x %02x", p[0], p[1], p[2], p[3]);
         return ARCHIVE_FATAL;
     }
+
+    LOG("raw bytecount: %d", hdr->block_flags.byte_count);
 
     // This should probably use bit reader interface in order to be more
     // future-proof.
     *block_size = 0;
     switch(hdr->block_flags.byte_count) {
+        // 1-byte block size
+        case 0: *block_size = *(const uint8_t*) &p[2]; break;
         // 2-byte block size
         case 1: *block_size = *(const uint16_t*) &p[2]; break;
         // 3-byte block size
@@ -1508,24 +1549,21 @@ static int parse_filter(struct rar5* rar, const uint8_t* p) {
     if(ARCHIVE_OK != parse_filter_data(rar, p, &block_start))
         return ARCHIVE_EOF;
 
-    LOG("[filter] block_start  = 0x%08x", block_start);
-
     if(ARCHIVE_OK != parse_filter_data(rar, p, &block_length))
         return ARCHIVE_EOF;
-
-    LOG("[filter] block_length = 0x%08x", block_length);
 
     if(ARCHIVE_OK != read_bits_16(rar, p, &filter_type))
         return ARCHIVE_EOF;
 
     filter_type >>= 13;
     skip_bits(rar, 3);
-    LOG("[filter] filter_type  = %d", filter_type);
 
     struct filter_info* filt = add_new_filter(rar);
     filt->type = filter_type;
-    filt->block_start = block_start;
+    filt->block_start = rar->compression.write_ptr + block_start;
     filt->block_length = block_length;
+
+    LOG("[filter] id=%d,rng=0x%08x-0x%08x type=%d", filt->id, filt->block_start, filt->block_length + filt->block_start, filt->type);
 
     // Only some filters will be processed here.
     switch(filter_type) {
@@ -1538,7 +1576,6 @@ static int parse_filter(struct rar5* rar, const uint8_t* p) {
                 return ARCHIVE_EOF;
 
             filt->channels = channels + 1;
-            LOG("[delta/audio] channels=%d", filt->channels);
             break;
         }
         case FILTER_RGB: {
