@@ -20,8 +20,10 @@
 
 #ifdef __GNUC__
 #define fallthrough __attribute__((fallthrough))
+#define unused      __attribute__((unused))
 #else
 #define fallthrough
+#define unused
 #endif
 
 static int rar5_read_data_skip(struct archive_read *a);
@@ -119,6 +121,13 @@ struct filter_info {
     uint16_t width;
 };
 
+struct data_ready {
+    char used;
+    const uint8_t* buf;
+    size_t size;
+    int64_t offset;
+};
+
 struct comp_state {
     int initialized : 1;
 
@@ -132,6 +141,7 @@ struct comp_state {
     size_t window_mask;
     ssize_t write_ptr;
     ssize_t last_write_ptr;
+    ssize_t written_ptr;
     ssize_t cur_block_size;
     int block_num;
     int computed_block_size;
@@ -147,9 +157,9 @@ struct comp_state {
     struct decode_table rd;
 
     struct filter_info* filters[8192];
-    int filter_count;
-
     int dist_cache[4];
+    struct data_ready dready[2];
+    int filter_count;
 };
 
 struct bit_reader {
@@ -191,7 +201,7 @@ struct rar5 {
 #define UNUSED(x) (void) (x)
 #define LOG(...)  do { printf(__VA_ARGS__); puts(""); } while(0)
 
-static void remove_filter(struct rar5* rar, size_t index) {
+unused static void remove_filter(struct rar5* rar, size_t index) {
     if(rar->cstate.filters[index] != NULL) {
         free(rar->cstate.filters[index]);
         rar->cstate.filters[index] = NULL;
@@ -289,7 +299,7 @@ static int run_e8e9_filter(struct rar5* rar, struct filter_info* flt, int extend
     return ARCHIVE_OK;
 }
 
-static int run_filter(struct rar5* rar, struct filter_info* flt) {
+unused static int run_filter(struct rar5* rar, struct filter_info* flt) {
     int ret;
 
     switch(flt->type) {
@@ -314,7 +324,7 @@ static int run_filter(struct rar5* rar, struct filter_info* flt) {
     return ARCHIVE_OK;
 }
 
-static int apply_filters(struct rar5* rar) {
+unused static int apply_filters(unused struct rar5* rar) {
     return ARCHIVE_OK;
 }
 
@@ -1765,9 +1775,14 @@ static int do_uncompress_block(struct archive_read* a,
     rar->cstate.block_parsing_finished = 0;
 
     while(1) {
+        if(rar->cstate.write_ptr - rar->cstate.last_write_ptr > (1 * 1024 * 1024)) {
+            // Don't allow growing data by more than 1 MB at a time.
+            break;
+        }
+
         if(rar->bits.in_addr > rar->cstate.cur_block_size - 1) {
-            /*LOG("natural break, because in_addr=%d < cur_block_size-1=%zu",*/
-                    /*rar->bits.in_addr, rar->cstate.cur_block_size - 1);*/
+            LOG("natural break, because in_addr=%d < cur_block_size-1=%zu",
+                    rar->bits.in_addr, rar->cstate.cur_block_size - 1);
 
             rar->cstate.block_parsing_finished = 1;
             break;
@@ -1775,9 +1790,9 @@ static int do_uncompress_block(struct archive_read* a,
 
         if(rar->bits.in_addr == rar->cstate.cur_block_size - 1) {
             if(rar->bits.bit_addr >= bit_size) {
-                /*LOG("natural break, because in_addr=%d == cur_block_size-1=%zu and bit_addr=%d >= bit_size=%d",*/
-                        /*rar->bits.in_addr, rar->cstate.cur_block_size - 1,*/
-                        /*rar->bits.bit_addr, bit_size);*/
+                LOG("natural break, because in_addr=%d == cur_block_size-1=%zu and bit_addr=%d >= bit_size=%d",
+                        rar->bits.in_addr, rar->cstate.cur_block_size - 1,
+                        rar->bits.bit_addr, bit_size);
 
                 rar->cstate.block_parsing_finished = 1;
                 break;
@@ -1941,7 +1956,7 @@ static int do_uncompress_block(struct archive_read* a,
     }
 
     if(rar->cstate.block_parsing_finished) {
-        /*LOG("natural end of block");*/
+        LOG("natural end of block");
     }
 
     return ARCHIVE_OK;
@@ -2038,6 +2053,40 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
         return CONTINUE;
 }
 
+static int use_data(struct rar5* rar, const void** buf, size_t* size, int64_t* offset) {
+    for(int i = 0; i < rar5_countof(rar->cstate.dready); i++) {
+        struct data_ready *d = &rar->cstate.dready[i];
+        if(d->used) {
+            *buf = d->buf;
+            *size = d->size;
+            *offset = d->offset;
+            d->used = 0;
+
+            return ARCHIVE_OK;
+        }
+    }
+
+    return ARCHIVE_RETRY;
+}
+
+static void push_data_ready(struct rar5* rar, const uint8_t* buf, size_t size, int64_t offset) {
+    ssize_t b = (ssize_t) buf - (ssize_t) rar->cstate.window_buf;
+    LOG("pushing data ready: buf=%zx, size=%zx, offset=%lx", b, size, offset);
+    for(int i = 0; i < rar5_countof(rar->cstate.dready); i++) {
+        struct data_ready* d = &rar->cstate.dready[i];
+        if(!d->used) {
+            d->used = 1;
+            d->buf = buf;
+            d->size = size;
+            d->offset = offset;
+            return;
+        }
+    }
+
+    LOG("internal rar5 unpacker error: premature end of data_ready stack");
+    exit(1);
+}
+
 static int do_uncompress_file(struct archive_read* a,
                            struct rar5* rar,
                            const void** buf,
@@ -2056,57 +2105,65 @@ static int do_uncompress_file(struct archive_read* a,
         rar->cstate.initialized = 1;
     }
 
-    LOG("--- processing block, addr=%d/%d", rar->bits.in_addr, rar->bits.bit_addr);
-    ret = process_block(a, rar);
-    /*LOG("--- end of processing block, ret=%d", ret);*/
-    switch(ret) {
-        case ERROR_EOF:
-            LOG("process_block returned ERROR_EOF");
-            return ARCHIVE_EOF;
-        case ERROR_FATAL:
-            LOG("process_block returned ERROR_FATAL");
-            return ARCHIVE_FATAL;
-        case LAST_BLOCK:
-            LOG("last block!");
-            exit(1);
+    while(1) {
+        LOG("--- processing block, addr=%d/%d", rar->bits.in_addr, rar->bits.bit_addr);
+        ret = process_block(a, rar);
+        switch(ret) {
+            case ERROR_EOF:
+                LOG("process_block returned ERROR_EOF");
+                return ARCHIVE_EOF;
+            case ERROR_FATAL:
+                LOG("process_block returned ERROR_FATAL");
+                return ARCHIVE_FATAL;
+            case LAST_BLOCK:
+                LOG("last block!");
+                exit(1);
+                break;
+        }
+
+        if(rar->cstate.last_write_ptr == rar->cstate.write_ptr) {
+            LOG("no data in this block, continuing");
+            continue;
+        } else 
             break;
     }
 
-    if(rar->cstate.last_write_ptr > rar->cstate.write_ptr) {
+    size_t mask = rar->cstate.window_mask;
+
+    // TODO support the case when 1 block will write more than a window size of data
+
+    if((rar->cstate.last_write_ptr & mask) > (rar->cstate.write_ptr & mask)) {
         rar->cstate.window_flip_count++;
     }
 
-    ssize_t unpacked_block_length = rar->cstate.write_ptr - rar->cstate.last_write_ptr;
-    LOG("written %zx bytes of data (flip %d), write_ptr=%x", unpacked_block_length & rar->cstate.window_mask, rar->cstate.window_flip_count, rar->cstate.write_ptr);
+    ssize_t unp_block_len = rar->cstate.write_ptr - rar->cstate.last_write_ptr;
+    LOG("block's unp_block_len=%zx", unp_block_len);
 
-    // TODO: allocate memory for filter output
+    ssize_t end_offset = (rar->cstate.last_write_ptr & mask) + unp_block_len;
+    if(end_offset > (ssize_t) rar->cstate.window_size) {
+        ssize_t frag1_size = rar->cstate.window_size - (rar->cstate.last_write_ptr & mask);
+        ssize_t frag2_size = unp_block_len - frag1_size;
 
-    ret = apply_filters(rar);
-    if(ret != ARCHIVE_OK) {
-        LOG("filter processing failed horribly");
-        return ARCHIVE_FATAL;
+        // TODO sanity checks frag1_size, frag2_size
+
+        push_data_ready(rar,
+            rar->cstate.window_buf + (rar->cstate.last_write_ptr & mask),
+            frag1_size,
+            rar->cstate.last_write_ptr);
+
+        push_data_ready(rar,
+            rar->cstate.window_buf,
+            frag2_size,
+            rar->cstate.last_write_ptr + frag1_size);
+    } else {
+        push_data_ready(rar, 
+            rar->cstate.window_buf + (rar->cstate.last_write_ptr & mask),
+            unp_block_len,
+            rar->cstate.last_write_ptr);
     }
 
-    /*memcpy(rar->cstate.filtered_buf + rar->cstate.last_write_ptr, */
-           /*rar->cstate.window_buf + rar->cstate.last_write_ptr, */
-           /*unpacked_block_length);*/
-
-    /*ret = apply_filters(rar);*/
-    /*if(ret != ARCHIVE_OK) {*/
-        /*LOG("filter processing failed horribly");*/
-        /*return ARCHIVE_FATAL;*/
-    /*}*/
-
-    /**buf = rar->cstate.filtered_buf;*/
-    *buf = rar->cstate.window_buf;
-    *size = unpacked_block_length & rar->cstate.window_mask;
-    *offset = rar->file.write_offset;
-
-    update_crc(rar, rar->cstate.filtered_buf, unpacked_block_length);
-
-    rar->file.write_offset += unpacked_block_length;
     rar->cstate.last_write_ptr = rar->cstate.write_ptr;
-    return ARCHIVE_OK;
+    return use_data(rar, buf, size, offset);
 }
 
 static int do_unstore_file(struct archive_read* a, 
@@ -2185,19 +2242,19 @@ static int do_unpack(struct archive_read* a,
 
 static int rar5_read_data(struct archive_read *a, const void **buff,
                                   size_t *size, int64_t *offset) {
-    UNUSED(a);
-    UNUSED(buff);
-    UNUSED(size);
-    UNUSED(offset);
-
+    int ret;
     struct rar5* rar = get_context(a);
+
+    ret = use_data(rar, buff, size, offset);
+    if(ret == ARCHIVE_OK)
+        return ret;
 
     if(rar->file.bytes_remaining == 0) {
         LOG("error: read data requested, but no bytes are remaining in the stream");
         return ARCHIVE_FATAL;
     }
 
-    int ret = do_unpack(a, rar, buff, size, offset);
+    ret = do_unpack(a, rar, buff, size, offset);
     if(ret != ARCHIVE_OK) {
         LOG("do_unpack returned error: %d", ret);
         return ret;
