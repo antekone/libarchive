@@ -209,6 +209,7 @@ unused static void remove_filter(struct rar5* rar, size_t index) {
     }
 }
 
+// TODO: change this to a circular array
 static struct filter_info* add_new_filter(struct rar5* rar) {
     struct filter_info* f = 
         (struct filter_info*) calloc(1, sizeof(struct filter_info));
@@ -328,10 +329,15 @@ static int apply_filters(struct rar5* rar, ssize_t unp_block_len) {
     struct filter_info* flt;
     int i;
 
-    /*for(i = 0; i < rar->cstate.filter_count; i++) {*/
-        /*flt = rar->cstate.filters[i];*/
+    for(i = 0; i < rar5_countof(rar->cstate.filters); i++) {
+        flt = rar->cstate.filters[i];
+        if(!flt) continue;
 
-    /*}*/
+        if(flt->block_start + flt->block_length > rar->cstate.write_ptr + unp_block_len) {
+            LOG("processing filter: %d", flt->type);
+        } else
+            return;
+    }
 
     return ARCHIVE_OK;
 }
