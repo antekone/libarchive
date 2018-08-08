@@ -1252,6 +1252,7 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
     rar->cstate.block_parsing_finished = 1;
     rar->cstate.all_filters_applied = 1;
     rar->cstate.unpacked_bytes = 0;
+    rar->cstate.initialized = 0;
 
     return ARCHIVE_OK;
 }
@@ -2437,11 +2438,6 @@ static int do_unpack(struct archive_read* a,
                      size_t* size, 
                      int64_t* offset) 
 {
-    if(is_solid(rar)) {
-        LOG("TODO: *** solid archives are not supported yet");
-        return ARCHIVE_FATAL;
-    }
-
     enum COMPRESSION_METHOD {
         STORE = 0, FASTEST = 1, FAST = 2, NORMAL = 3, GOOD = 4, BEST = 5
     };
@@ -2514,7 +2510,7 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
         } else if(!check_crc) {
             LOG("warning: this entry doesn't have CRC info");
         } else {
-            LOG("file crc ok");
+            LOG("file crc ok: 0x%08x", rar->file.calculated_crc32);
         }
     }
 
