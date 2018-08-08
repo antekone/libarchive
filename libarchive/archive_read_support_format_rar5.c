@@ -2482,7 +2482,7 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
         return ret;
     }
 
-    ret = use_data(rar, buff, size, offset);
+    (void) use_data(rar, buff, size, offset);
 
     if(rar->file.bytes_remaining == 0 && rar->cstate.last_write_ptr == rar->cstate.write_ptr) {
         // Fully unpacked the file.
@@ -2518,12 +2518,7 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
         }
     }
 
-    if(ret == ARCHIVE_RETRY) {
-        LOG("internal error, use_data shouldn't return ARCHIVE_RETRY here");
-        return ARCHIVE_FATAL;
-    }
-
-    return ret;
+    return ARCHIVE_OK;
 }
 
 static int rar5_read_data_skip(struct archive_read *a) {
