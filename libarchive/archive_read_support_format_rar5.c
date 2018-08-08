@@ -354,7 +354,7 @@ static int run_delta_filter(struct rar5* rar, struct filter_info* flt) {
     int i;
     uint32_t dest_pos, src_pos = 0;
 
-    LOG("run_delta_filter id=%d @ 0x%08x-0x%08x, channels=%d", flt->id, flt->block_start, flt->block_start + flt->block_length - 1, flt->channels);
+    /*LOG("run_delta_filter id=%d @ 0x%08x-0x%08x, channels=%d", flt->id, flt->block_start, flt->block_start + flt->block_length - 1, flt->channels);*/
     
     for(i = 0; i < flt->channels; i++) {
         uint8_t prev_byte = 0;
@@ -407,7 +407,7 @@ static int run_e8e9_filter(struct rar5* rar, struct filter_info* flt, int extend
     const uint32_t file_size = 0x1000000;
     uint32_t i;
 
-    LOG("run_e8e9_filter, from 0x%x to 0x%x", flt->block_start, flt->block_start + flt->block_length - 1);
+    /*LOG("run_e8e9_filter, from 0x%x to 0x%x", flt->block_start, flt->block_start + flt->block_length - 1);*/
 
     circular_memcpy(rar->cstate.filtered_buf, 
         rar->cstate.window_buf, 
@@ -525,32 +525,32 @@ static int apply_filters(struct rar5* rar, unused ssize_t unp_block_len) {
     struct filter_info* flt;
     int ret;
 
-    LOG("processing filters, last_write_ptr=0x%zx, write_ptr=0x%zx", rar->cstate.last_write_ptr, rar->cstate.write_ptr);
+    /*LOG("processing filters, last_write_ptr=0x%zx, write_ptr=0x%zx", rar->cstate.last_write_ptr, rar->cstate.write_ptr);*/
 
     rar->cstate.all_filters_applied = 0;
     while(CDE_OK == cdeque_front(&rar->cstate.filters, cdeque_filter_p(&flt))) {
-        LOG("will process filter 0x%08x-0x%08x?", flt->block_start, flt->block_start + flt->block_length - 1);
-        LOG("orig block start:   0x%08x", flt->orig_block_start);
+        /*LOG("will process filter 0x%08x-0x%08x?", flt->block_start, flt->block_start + flt->block_length - 1);*/
+        /*LOG("orig block start:   0x%08x", flt->orig_block_start);*/
 
         if(rar->cstate.write_ptr > flt->block_start && rar->cstate.write_ptr > flt->block_start + flt->block_length) {
             if(rar->cstate.last_write_ptr == flt->block_start) {
-                LOG("yes, can run filter");
+                /*LOG("yes, can run filter");*/
                 ret = run_filter(rar, flt);
                 if(ret != ARCHIVE_OK) {
                     LOG("filter failure, returning error");
                     return ret;
                 }
 
-                LOG("filter executed, removing it from queue");
+                /*LOG("filter executed, removing it from queue");*/
                 (void) cdeque_pop_front(&rar->cstate.filters, cdeque_filter_p(&flt));
                 return ARCHIVE_RETRY;
             } else {
-                LOG("not yet, will dump memory right before the filter");
+                /*LOG("not yet, will dump memory right before the filter");*/
                 push_window_data(rar, rar->cstate.last_write_ptr, flt->block_start);
                 return ARCHIVE_RETRY;
             }
         } else {
-            LOG("no, can't run this filter yet");
+            /*LOG("no, can't run this filter yet");*/
             break;
         }
     }
@@ -1866,7 +1866,7 @@ static int parse_filter(struct rar5* rar, const uint8_t* p) {
     filt->block_start = rar->cstate.write_ptr + block_start;
     filt->block_length = block_length;
 
-    LOG("[filter] id=%d,rng=0x%08x-0x%08x type=%d", filt->id, filt->block_start, filt->block_length + filt->block_start - 1, filt->type);
+    /*LOG("[filter] id=%d,rng=0x%08x-0x%08x type=%d", filt->id, filt->block_start, filt->block_length + filt->block_start - 1, filt->type);*/
 
     // Only some filters will be processed here.
     switch(filter_type) {
@@ -2271,7 +2271,9 @@ static int use_data(struct rar5* rar, const void** buf, size_t* size, int64_t* o
             *offset = d->offset;
             d->used = 0;
 
-            /*unused ssize_t b = (ssize_t) *buf - (ssize_t) rar->cstate.window_buf;*/
+            update_crc(rar, d->buf, d->size);
+
+            unused ssize_t b = (ssize_t) *buf - (ssize_t) rar->cstate.window_buf;
             /*LOG("using data: buf=%zx, size=%zx, offset=%lx", b, *size, *offset);*/
             return ARCHIVE_OK;
         }
@@ -2282,7 +2284,7 @@ static int use_data(struct rar5* rar, const void** buf, size_t* size, int64_t* o
 
 static void push_data_ready(struct rar5* rar, const uint8_t* buf, size_t size, int64_t offset) {
     unused ssize_t b = (ssize_t) buf - (ssize_t) rar->cstate.window_buf;
-    LOG("pushing data ready: buf=%zx, size=%zx, offset=%lx", b, size, offset);
+    /*LOG("pushing data ready: buf=%zx, size=%zx, offset=%lx", b, size, offset);*/
     for(int i = 0; i < rar5_countof(rar->cstate.dready); i++) {
         struct data_ready* d = &rar->cstate.dready[i];
         if(!d->used) {
@@ -2304,18 +2306,13 @@ static int do_uncompress_file(struct archive_read* a,
     const size_t mask = rar->cstate.window_mask;
     int ret;
 
-    if(rar->cstate.version != 50) {
-        LOG("compression version not supported: %d", rar->cstate.version);
-        return ARCHIVE_FATAL;
-    }
-
     if(!rar->cstate.initialized) {
         init_unpack(rar);
         rar->cstate.initialized = 1;
     }
 
     if(rar->cstate.all_filters_applied == 1) {
-        LOG("--- processing blocks...");
+        /*LOG("--- processing blocks...");*/
         // This loop will iterate only when current block won't emit any data. If
         // the block has written any data at all, the loop will break.
         while(1) {
@@ -2361,7 +2358,7 @@ static int do_uncompress_file(struct archive_read* a,
     ssize_t max_end_pos;
 
     if(cdeque_size(&rar->cstate.filters) > 0) {
-        LOG("checking if we can write something before hitting first filter...");
+        /*LOG("checking if we can write something before hitting first filter...");*/
         struct filter_info* flt;
         if(CDE_OK != cdeque_front(&rar->cstate.filters, cdeque_filter_p(&flt))) {
             LOG("internal error, can't read first filter");
@@ -2376,9 +2373,9 @@ static int do_uncompress_file(struct archive_read* a,
 
     if(max_end_pos == rar->cstate.last_write_ptr) {
         // can't write anything... ;(
-        LOG("can't write anything, we have to loop, return 0 bytes or retry request");
-        LOG("we're standing on 0x%08zx, last generated byte is 0x%08zx", rar->cstate.last_write_ptr,
-                rar->cstate.write_ptr);
+        /*LOG("can't write anything, we have to loop, return 0 bytes or retry request");*/
+        /*LOG("we're standing on 0x%08zx, last generated byte is 0x%08zx", rar->cstate.last_write_ptr,*/
+                /*rar->cstate.write_ptr);*/
         return ARCHIVE_RETRY;
     } else {
         // can write something before hitting first filter. do it now.
@@ -2445,12 +2442,6 @@ static int do_unpack(struct archive_read* a,
         return ARCHIVE_FATAL;
     }
 
-    if(rar->cstate.method > 5) {
-        LOG("do_unpack: Unknown compression method");
-        archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT, "Unknown compression method");
-        return ARCHIVE_FATAL;
-    }
-
     enum COMPRESSION_METHOD {
         STORE = 0, FASTEST = 1, FAST = 2, NORMAL = 3, GOOD = 4, BEST = 5
     };
@@ -2491,10 +2482,9 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
         return ret;
     }
 
-    /*LOG("bytes_remaining: %zu", rar->file.bytes_remaining);*/
+    ret = use_data(rar, buff, size, offset);
 
-    // TODO: move this if into `finish_file` or something similar
-    if(rar->file.bytes_remaining == 0) {
+    if(rar->file.bytes_remaining == 0 && rar->cstate.last_write_ptr == rar->cstate.write_ptr) {
         // Fully unpacked the file.
         //
         // Sanity check.
@@ -2517,18 +2507,23 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
                     rar->file.calculated_crc32,
                     rar->file.stored_crc32);
 
-            /*archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,*/
-                              /*"File CRC error");*/
+            archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                              "File CRC error");
 
-            /*return ARCHIVE_FATAL;*/
+            return ARCHIVE_FATAL;
         } else if(!check_crc) {
             LOG("warning: this entry doesn't have CRC info");
         } else {
-            /*LOG("file crc ok");*/
+            LOG("file crc ok");
         }
     }
 
-    return ARCHIVE_OK;
+    if(ret == ARCHIVE_RETRY) {
+        LOG("internal error, use_data shouldn't return ARCHIVE_RETRY here");
+        return ARCHIVE_FATAL;
+    }
+
+    return ret;
 }
 
 static int rar5_read_data_skip(struct archive_read *a) {
