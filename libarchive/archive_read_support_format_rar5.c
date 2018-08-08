@@ -95,6 +95,7 @@ struct filter_info {
     uint32_t block_start;
     uint32_t block_length;
     uint16_t width;
+    uint32_t orig_block_start;
 };
 
 struct data_ready {
@@ -363,11 +364,6 @@ static int run_delta_filter(struct rar5* rar, struct filter_info* flt) {
             byte = rar->cstate.window_buf[(flt->block_start + src_pos) & rar->cstate.window_mask];
             prev_byte -= byte;
 
-            if(flt->block_start + dest_pos >= rar->cstate.window_size) {
-                LOG("sanity check: out of bounds write");
-                return ARCHIVE_FATAL;
-            }
-
             rar->cstate.filtered_buf[dest_pos] = prev_byte;
 
             /*LOG("%02d %04d/%04d Data[%d]=%02x  -> DstData[%d]=%02x", i, dest_pos, flt->block_length,*/
@@ -411,7 +407,7 @@ static int run_e8e9_filter(struct rar5* rar, struct filter_info* flt, int extend
     const uint32_t file_size = 0x1000000;
     uint32_t i;
 
-    LOG("run_e8e9_filter, from 0x%x", flt->block_start);
+    LOG("run_e8e9_filter, from 0x%x to 0x%x", flt->block_start, flt->block_start + flt->block_length - 1);
 
     circular_memcpy(rar->cstate.filtered_buf, 
         rar->cstate.window_buf, 
@@ -420,24 +416,30 @@ static int run_e8e9_filter(struct rar5* rar, struct filter_info* flt, int extend
         flt->block_start + flt->block_length);
 
     for(i = 0; i < flt->block_length - 4;) {
-        uint8_t b = rar->cstate.window_buf[i++ & rar->cstate.window_mask];
+        uint8_t b = rar->cstate.window_buf[(flt->block_start + i++) & rar->cstate.window_mask];
 
         if(b == 0xE8 || (extended && b == 0xE9)) {
             uint32_t addr;
+            uint32_t offset = (i + flt->block_start) % file_size;
 
-            LOG("found 0xE8/0xE9 on pos 0x%x", flt->block_start + i);
+            /*LOG("found 0xE8/0xE9 on pos 0x%x", flt->block_start + i);*/
             addr = read_filter_data(rar, (flt->block_start + i) & rar->cstate.window_mask);
             /*LOG("addr=%08x", addr);*/
 
             if(addr & 0x80000000) {
-                if(((addr + i) & 0x80000000) == 0) {
+                if(((addr + offset) & 0x80000000) == 0) {
                     write_filter_data(rar, i, addr + file_size);
                     /*LOG("#1: stored %08x", addr + file_size);*/
+                } else {
+                    /*LOG("skip #1");*/
                 }
             } else {
                 if((addr - file_size) & 0x80000000) {
-                    write_filter_data(rar, i, addr - (flt->block_start + i));
-                    /*LOG("#2: stored %08x", addr - i);*/
+                    uint32_t naddr = addr - offset;
+                    /*LOG("writting %08x", naddr);*/
+                    write_filter_data(rar, i, naddr);
+                } else {
+                    /*LOG("skip #2");*/
                 }
             }
 
@@ -521,17 +523,24 @@ static void push_window_data(unused struct rar5* rar, ssize_t idx_begin, ssize_t
 
 static int apply_filters(struct rar5* rar, unused ssize_t unp_block_len) {
     struct filter_info* flt;
+    int ret;
 
     LOG("processing filters, last_write_ptr=0x%zx, write_ptr=0x%zx", rar->cstate.last_write_ptr, rar->cstate.write_ptr);
 
     rar->cstate.all_filters_applied = 0;
     while(CDE_OK == cdeque_front(&rar->cstate.filters, cdeque_filter_p(&flt))) {
         LOG("will process filter 0x%08x-0x%08x?", flt->block_start, flt->block_start + flt->block_length - 1);
+        LOG("orig block start:   0x%08x", flt->orig_block_start);
 
         if(rar->cstate.write_ptr > flt->block_start && rar->cstate.write_ptr > flt->block_start + flt->block_length) {
             if(rar->cstate.last_write_ptr == flt->block_start) {
                 LOG("yes, can run filter");
-                run_filter(rar, flt);
+                ret = run_filter(rar, flt);
+                if(ret != ARCHIVE_OK) {
+                    LOG("filter failure, returning error");
+                    return ret;
+                }
+
                 LOG("filter executed, removing it from queue");
                 (void) cdeque_pop_front(&rar->cstate.filters, cdeque_filter_p(&flt));
                 return ARCHIVE_RETRY;
@@ -1853,6 +1862,7 @@ static int parse_filter(struct rar5* rar, const uint8_t* p) {
 
     struct filter_info* filt = add_new_filter(rar);
     filt->type = filter_type;
+    filt->orig_block_start = block_start;
     filt->block_start = rar->cstate.write_ptr + block_start;
     filt->block_length = block_length;
 
