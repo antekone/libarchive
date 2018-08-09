@@ -1,3 +1,30 @@
+/*-
+* Copyright (c) 2018 Grzegorz Antoniak
+* All rights reserved.
+*
+* Redistribution and use in source and binary forms, with or without
+* modification, are permitted provided that the following conditions
+* are met:
+* 1. Redistributions of source code must retain the above copyright
+*    notice, this list of conditions and the following disclaimer.
+* 2. Redistributions in binary form must reproduce the above copyright
+*    notice, this list of conditions and the following disclaimer in the
+*    documentation and/or other materials provided with the distribution.
+*
+* THIS SOFTWARE IS PROVIDED BY THE AUTHOR(S) ``AS IS'' AND ANY EXPRESS OR
+* IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+* OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+* IN NO EVENT SHALL THE AUTHOR(S) BE LIABLE FOR ANY DIRECT, INDIRECT,
+* INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+* NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+* DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+* THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+* THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
+// TODO: test unpacking on a 100gb file
+
 #include "archive_platform.h"
 
 #ifdef HAVE_ERRNO_H
@@ -105,6 +132,7 @@ struct data_ready {
     int64_t offset;
 };
 
+// TODO: make these fields int16_t
 struct cdeque {
     int beg_pos;
     int end_pos;
@@ -144,6 +172,7 @@ struct comp_state {
 
     struct cdeque filters;
     int dist_cache[4];
+    // TODO: convert this to cdeque
     struct data_ready dready[2];
     int filter_count;
 };
@@ -1767,13 +1796,13 @@ static int parse_tables(struct archive_read* a,
 
 static int parse_block_header(const uint8_t* p, ssize_t* block_size, struct compressed_block_header* hdr) {
     memcpy(hdr, p, sizeof(struct compressed_block_header));
-    /*LOG("parsing block header: ptr is %02x %02x %02x %02x", p[0], p[1], p[2], p[3]);*/
+    LOG("parsing block header: ptr is %02x %02x %02x %02x", p[0], p[1], p[2], p[3]);
     if(hdr->block_flags.byte_count == 3) {
         LOG("block header byte_count is %d", hdr->block_flags.byte_count);
         return ARCHIVE_FATAL;
     }
 
-    /*LOG("raw bytecount: %d", hdr->block_flags.byte_count);*/
+    LOG("raw bytecount: %d", hdr->block_flags.byte_count);
 
     // This should probably use bit reader interface in order to be more
     // future-proof.
@@ -1808,12 +1837,14 @@ static int parse_block_header(const uint8_t* p, ssize_t* block_size, struct comp
 
     if(calculated_cksum != hdr->block_cksum) {
         LOG("Checksum error in compressed data block header, file corrupted?");
+        LOG("Checksum stored in file: %02x, checksum calculated: %02x",
+            hdr->block_cksum, calculated_cksum);
         return ARCHIVE_FATAL;
     } else {
         /*LOG("Block header checksum ok");*/
     }
 
-    /*LOG("hdr=%p, block header last? %d, tables? %d", hdr, hdr->block_flags.is_last_block, hdr->block_flags.is_table_present);*/
+    LOG("hdr=%p, block header last? %d, tables? %d", hdr, hdr->block_flags.is_last_block, hdr->block_flags.is_table_present);
     return ARCHIVE_OK;
 }
 
