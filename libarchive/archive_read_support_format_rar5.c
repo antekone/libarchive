@@ -159,6 +159,7 @@ struct comp_state {
     size_t window_mask;
     ssize_t write_ptr;
     ssize_t last_write_ptr;
+    ssize_t solid_offset;
     ssize_t unpacked_bytes;
     ssize_t cur_block_size;
     int block_num;
@@ -377,14 +378,14 @@ static int run_delta_filter(struct rar5* rar, struct filter_info* flt) {
         for(dest_pos = i; dest_pos < flt->block_length; dest_pos += flt->channels) {
             uint8_t byte;
 
-            byte = rar->cstate.window_buf[(flt->block_start + src_pos) & rar->cstate.window_mask];
+            byte = rar->cstate.window_buf[(rar->cstate.solid_offset + flt->block_start + src_pos) & rar->cstate.window_mask];
             prev_byte -= byte;
 
             rar->cstate.filtered_buf[dest_pos] = prev_byte;
 
             /*LOG("%02d %04d/%04d Data[%d]=%02x  -> DstData[%d]=%02x", i, dest_pos, flt->block_length,*/
-                    /*flt->block_start + src_pos,*/
-                    /*rar->cstate.window_buf[flt->block_start + src_pos],*/
+                    /*rar->cstate.solid_offset + flt->block_start + src_pos,*/
+                    /*rar->cstate.window_buf[(rar->cstate.solid_offset + flt->block_start + src_pos) & rar->cstate.window_mask],*/
                     /*dest_pos,*/
                     /*rar->cstate.filtered_buf[flt->block_start + dest_pos]);*/
 
@@ -409,11 +410,11 @@ static int run_e8e9_filter(struct rar5* rar, struct filter_info* flt, int extend
     circular_memcpy(rar->cstate.filtered_buf, 
         rar->cstate.window_buf, 
         rar->cstate.window_mask, 
-        flt->block_start, 
-        flt->block_start + flt->block_length);
+        rar->cstate.solid_offset + flt->block_start, 
+        rar->cstate.solid_offset + flt->block_start + flt->block_length);
 
     for(i = 0; i < flt->block_length - 4;) {
-        uint8_t b = rar->cstate.window_buf[(flt->block_start + i++) & rar->cstate.window_mask];
+        uint8_t b = rar->cstate.window_buf[(rar->cstate.solid_offset + flt->block_start + i++) & rar->cstate.window_mask];
 
         if(b == 0xE8 || (extended && b == 0xE9)) {
             // 0xE8 = x86's call <relative_addr_uint32> (function call)
@@ -423,7 +424,7 @@ static int run_e8e9_filter(struct rar5* rar, struct filter_info* flt, int extend
             uint32_t offset = (i + flt->block_start) % file_size;
 
             /*LOG("found 0xE8/0xE9 on pos 0x%x", flt->block_start + i);*/
-            addr = read_filter_data(rar, (flt->block_start + i) & rar->cstate.window_mask);
+            addr = read_filter_data(rar, (rar->cstate.solid_offset + flt->block_start + i) & rar->cstate.window_mask);
             /*LOG("addr=%08x", addr);*/
 
             if(addr & 0x80000000) {
@@ -462,14 +463,14 @@ static int run_arm_filter(struct rar5* rar, struct filter_info* flt) {
     circular_memcpy(rar->cstate.filtered_buf, 
         rar->cstate.window_buf, 
         rar->cstate.window_mask, 
-        flt->block_start, 
-        flt->block_start + flt->block_length);
+        rar->cstate.solid_offset + flt->block_start, 
+        rar->cstate.solid_offset + flt->block_start + flt->block_length);
 
     for(i = 0; i < flt->block_length - 3; i += 4) {
-        uint8_t* b = &rar->cstate.window_buf[(flt->block_start + i) & mask];
+        uint8_t* b = &rar->cstate.window_buf[(rar->cstate.solid_offset + flt->block_start + i) & mask];
         if(b[3] == 0xEB) {
             // 0xEB = ARM's BL (branch + link) instruction
-            offset = read_filter_data(rar, (flt->block_start + i) & mask) & 0x00ffffff;
+            offset = read_filter_data(rar, (rar->cstate.solid_offset + flt->block_start + i) & mask) & 0x00ffffff;
             offset -= (i + flt->block_start) / 4;
             offset = (offset & 0x00ffffff) | 0xeb000000;
             write_filter_data(rar, i, offset);
@@ -526,28 +527,30 @@ static int run_filter(struct rar5* rar, struct filter_info* flt) {
 static void push_data(struct rar5* rar, const uint8_t* buf, ssize_t idx_begin, ssize_t idx_end) {
     const int mask = rar->cstate.window_mask;
 
+    LOG("push_data: idx_begin=%x, idx_end=%x", idx_begin, idx_end);
+
     if((idx_begin & mask) > (idx_end & mask)) {
-        ssize_t frag1_size = rar->cstate.window_size - (rar->cstate.last_write_ptr & mask);
+        ssize_t frag1_size = rar->cstate.window_size - (rar->cstate.solid_offset + rar->cstate.last_write_ptr & mask);
         ssize_t frag2_size = (idx_end - idx_begin) - frag1_size;
 
-        /*LOG("idx_begin=0x%zx, idx_end=0x%zx", idx_begin, idx_end);*/
-        /*LOG("frag1_size=0x%zx", frag1_size);*/
-        /*LOG("frag2_size=0x%zx", frag2_size);*/
+        LOG("idx_begin=0x%zx, idx_end=0x%zx", idx_begin, idx_end);
+        LOG("frag1_size=0x%zx", frag1_size);
+        LOG("frag2_size=0x%zx", frag2_size);
 
         push_data_ready(rar,
-            buf + (rar->cstate.last_write_ptr & mask),
+            buf + (rar->cstate.solid_offset + rar->cstate.last_write_ptr & mask),
             frag1_size,
             rar->cstate.last_write_ptr);
 
         push_data_ready(rar,
-            buf,
+            buf + rar->cstate.solid_offset,
             frag2_size,
             rar->cstate.last_write_ptr + frag1_size);
 
         rar->cstate.last_write_ptr += frag1_size + frag2_size;
     } else {
         push_data_ready(rar,
-            buf + (rar->cstate.last_write_ptr & mask),
+            buf + (rar->cstate.solid_offset + rar->cstate.last_write_ptr & mask),
             idx_end - idx_begin,
             rar->cstate.last_write_ptr);
 
@@ -569,7 +572,7 @@ static int apply_filters(struct rar5* rar) {
     while(CDE_OK == cdeque_front(&rar->cstate.filters, cdeque_filter_p(&flt))) {
         if(rar->cstate.write_ptr > flt->block_start && rar->cstate.write_ptr >= flt->block_start + flt->block_length) {
             if(rar->cstate.last_write_ptr == flt->block_start) {
-                LOG("will process filter 0x%08x-0x%08x", flt->block_start, flt->block_start + flt->block_length - 1);
+                LOG("will process filter %d 0x%08x-0x%08x", flt->type, flt->block_start, flt->block_start + flt->block_length - 1);
                 ret = run_filter(rar, flt);
                 if(ret != ARCHIVE_OK) {
                     LOG("filter failure, returning error");
@@ -627,6 +630,13 @@ static void reset_filters(struct rar5* rar);
 
 static void reset_file_context(struct rar5* rar) {
     memset(&rar->file, 0, sizeof(rar->file));
+    
+    if(rar->main.solid) {
+        rar->cstate.solid_offset = rar->cstate.write_ptr;
+    } else {
+        rar->cstate.solid_offset = 0;
+    }
+
     rar->cstate.write_ptr = 0;
     rar->cstate.last_write_ptr = 0;
     reset_filters(rar);
@@ -2017,25 +2027,25 @@ static int decode_code_length(struct rar5* rar, const uint8_t* p, uint16_t code)
 }
 
 static int copy_string(struct rar5* rar, int len, int dist) {
-    ssize_t write_ptr = rar->cstate.write_ptr;
+    ssize_t write_ptr = rar->cstate.write_ptr + rar->cstate.solid_offset;
     int i;
 
-    if(!rar->skip_mode)
-        printf("copy_string: ");
+    /*if(!rar->skip_mode)*/
+        /*printf("copy_string (len=%d dist=%d, srcptr=%d): ", len, dist, (write_ptr - dist) & rar->cstate.window_mask);*/
 
     for(i = 0; i < len; i++) {
         uint8_t src_byte = 
             rar->cstate.window_buf[(write_ptr - dist + i) & rar->cstate.window_mask];
 
-        if(!rar->skip_mode)
-            printf("%02x ", src_byte);
+        /*if(!rar->skip_mode)*/
+            /*printf("%02x ", src_byte);*/
 
         rar->cstate.window_buf[(write_ptr + i) & rar->cstate.window_mask] =
             src_byte;
     }
 
-    if(!rar->skip_mode)
-        printf("\n");
+    /*if(!rar->skip_mode)*/
+        /*printf("\n");*/
 
     rar->cstate.write_ptr += len;
     return ARCHIVE_OK;
@@ -2085,8 +2095,8 @@ static int do_uncompress_block(struct archive_read* a,
             return ARCHIVE_EOF;
         }
 
-        if(!rar->skip_mode)
-        LOG("--> code=%03d (code=%d, addr=%d, bit=%d, cbs=%d)", num, rar->cstate.code_seq, rar->bits.in_addr, rar->bits.bit_addr, rar->cstate.computed_block_size);
+        /*if(!rar->skip_mode)*/
+        /*LOG("--> code=%03d (seq=%d)", num, rar->cstate.code_seq);*/
 
         // num = RARv5 command code. 
         //
@@ -2101,10 +2111,10 @@ static int do_uncompress_block(struct archive_read* a,
         // of data.
         if(num < 256) {
             // Store literal directly.
-            if(!rar->skip_mode)
-                LOG("* BYTE: 0x%02x", num);
+            /*if(!rar->skip_mode)*/
+                /*LOG("write byte: 0x%02x", num);*/
 
-            rar->cstate.window_buf[rar->cstate.write_ptr++ & rar->cstate.window_mask] = 
+            rar->cstate.window_buf[(rar->cstate.solid_offset + rar->cstate.write_ptr++) & rar->cstate.window_mask] = 
                 (uint8_t) num;
 
             continue;
@@ -2199,13 +2209,11 @@ static int do_uncompress_block(struct archive_read* a,
         } else if(num == 256) {
             // Create a filter
             int prev_addr = rar->bits.in_addr;
-            LOG("before filter parsing: addr=%d", rar->bits.in_addr);
             ret = parse_filter(rar, p);
             if(ret != ARCHIVE_OK) {
                 LOG("filter parsing fail");
                 return ARCHIVE_EOF;
             }
-            LOG("after filter parsing: addr=%d, delta=%d", rar->bits.in_addr, rar->bits.in_addr - prev_addr);
 
             continue;
         } else if(num == 257) {
@@ -2353,8 +2361,8 @@ static int use_data(struct rar5* rar, const void** buf, size_t* size, int64_t* o
 
             update_crc(rar, d->buf, d->size);
 
-            /*unused ssize_t b = (ssize_t) *buf - (ssize_t) rar->cstate.window_buf;*/
-            /*LOG("using data: buf=%zx, size=%zx, offset=%lx", b, *size, *offset);*/
+            LOG("using data: buf=%zx, size=%zx, offset=%lx", d->buf, d->size, d->offset);
+            LOG("window_buf:     %zx", &rar->cstate.window_buf[0]);
             return ARCHIVE_OK;
         }
     }
@@ -2383,6 +2391,15 @@ static void push_data_ready(struct rar5* rar, const uint8_t* buf, size_t size, i
     exit(1);
 }
 
+static void dump_window_buf(struct rar5* rar) {
+    int col = 0;
+
+    LOG("dumping window.bin");
+    FILE* fw = fopen("window.bin", "wb");
+    fwrite(rar->cstate.window_buf, rar->cstate.window_mask + 1, 1, fw);
+    fclose(fw);
+}
+
 static int do_uncompress_file(struct archive_read* a,
                            struct rar5* rar)
 {
@@ -2393,8 +2410,12 @@ static int do_uncompress_file(struct archive_read* a,
         if(!rar->main.solid || !rar->cstate.window_buf) {
             LOG("*** init_unpack");
             init_unpack(rar);
+        } else if(rar->main.solid) {
+            LOG("*** solid init");
+            dump_window_buf(rar);
         }
 
+        rar->cstate.code_seq = 0;
         rar->cstate.initialized = 1;
     }
 
@@ -2662,7 +2683,9 @@ static int rar5_read_data_skip(struct archive_read *a) {
 
         while(rar->file.bytes_remaining > 0) {
             rar->skip_mode = 1;
+            LOG("enabling skip_mode");
             ret = rar5_read_data(a, NULL, NULL, NULL);
+            LOG("disabling skip_mode");
             rar->skip_mode = 0;
 
             if(ret < 0) {
