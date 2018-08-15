@@ -54,6 +54,8 @@
 #define unused
 #endif
 
+#define DONT_FAIL_ON_CRC_ERROR
+
 //#define SKIP_CRC_FAILURE
 
 static int rar5_read_data_skip(struct archive_read *a);
@@ -199,13 +201,21 @@ struct compressed_block_header {
     uint8_t block_cksum;
 };
 
+struct main_header {
+    uint8_t solid : 1;
+    uint8_t volume : 1;
+    uint8_t notused : 6;
+};
+
 struct rar5 {
     int header_initialized;
     int skipped_magic;
+    int skip_mode;
 
     uint64_t qlist_offset;    // not used by this unpacker
     uint64_t rr_offset;       // not used by this unpacker
 
+    struct main_header main;
     struct comp_state cstate;
     struct file_header file;
     struct bit_reader bits;
@@ -620,6 +630,10 @@ static void reset_file_context(struct rar5* rar) {
     rar->cstate.write_ptr = 0;
     rar->cstate.last_write_ptr = 0;
     reset_filters(rar);
+}
+
+static int is_solid(struct rar5* rar) {
+    return (rar->cstate.flags & CIF_SOLID) > 0;
 }
 
 static void set_solid(struct rar5* rar, int flag) {
@@ -1231,6 +1245,7 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
 
     /*LOG("window_size=%zu", rar->cstate.window_size);*/
 
+    LOG("compression_info: %08x", compression_info);
     set_solid(rar, (int) (compression_info & SOLID));
 
     if(!read_var_sized(a, &host_os, NULL))
@@ -1343,8 +1358,13 @@ static int process_head_main(struct archive_read* a, struct rar5* rar, struct ar
 
     LOG("archive flags: 0x%08zu", archive_flags);
     if(archive_flags & VOLUME) {
+        rar->main.volume = 1;
         LOG("*** volume archives not supported yet"); // TODO implement this
         return ARCHIVE_FATAL;
+    }
+
+    if(archive_flags & SOLID) {
+        rar->main.solid = 1;
     }
 
     if(extra_data_size == 0) {
@@ -1407,17 +1427,23 @@ static int process_base_block(struct archive_read* a, struct rar5* rar, struct a
 
     /*LOG("hdr_crc=%08x", hdr_crc);*/
 
-    if(!read_var_sized(a, &raw_hdr_size, &hdr_size_len))
+    if(!read_var_sized(a, &raw_hdr_size, &hdr_size_len)) {
+        LOG("can't read hdr_size");
         return ARCHIVE_EOF;
+    }
 
     // Sanity check, maximum header size for RAR5 is 2MB.
-    if(raw_hdr_size > (2 * 1024 * 1024))
+    if(raw_hdr_size > (2 * 1024 * 1024)) {
+        LOG("bad hdr_size");
         return ARCHIVE_FATAL;
+    }
 
     hdr_size = raw_hdr_size + hdr_size_len;
 
-    if(!read_ahead(a, hdr_size, &p))
+    if(!read_ahead(a, hdr_size, &p)) {
+        LOG("can't read hdr buf");
         return ARCHIVE_EOF;
+    }
 
     computed_crc = (uint32_t) crc32(0, p, (int) hdr_size);
     if(computed_crc != hdr_crc) {
@@ -1994,10 +2020,22 @@ static int copy_string(struct rar5* rar, int len, int dist) {
     ssize_t write_ptr = rar->cstate.write_ptr;
     int i;
 
+    if(!rar->skip_mode)
+        printf("copy_string: ");
+
     for(i = 0; i < len; i++) {
-        rar->cstate.window_buf[(write_ptr + i) & rar->cstate.window_mask] =
+        uint8_t src_byte = 
             rar->cstate.window_buf[(write_ptr - dist + i) & rar->cstate.window_mask];
+
+        if(!rar->skip_mode)
+            printf("%02x ", src_byte);
+
+        rar->cstate.window_buf[(write_ptr + i) & rar->cstate.window_mask] =
+            src_byte;
     }
+
+    if(!rar->skip_mode)
+        printf("\n");
 
     rar->cstate.write_ptr += len;
     return ARCHIVE_OK;
@@ -2047,7 +2085,8 @@ static int do_uncompress_block(struct archive_read* a,
             return ARCHIVE_EOF;
         }
 
-        /*LOG("--> code=%03d (code=%d, addr=%d, bit=%d, cbs=%d)", num, rar->cstate.code_seq, rar->bits.in_addr, rar->bits.bit_addr, rar->cstate.computed_block_size);*/
+        if(!rar->skip_mode)
+        LOG("--> code=%03d (code=%d, addr=%d, bit=%d, cbs=%d)", num, rar->cstate.code_seq, rar->bits.in_addr, rar->bits.bit_addr, rar->cstate.computed_block_size);
 
         // num = RARv5 command code. 
         //
@@ -2062,7 +2101,9 @@ static int do_uncompress_block(struct archive_read* a,
         // of data.
         if(num < 256) {
             // Store literal directly.
-            /*LOG("* BYTE: 0x%02x", num);*/
+            if(!rar->skip_mode)
+                LOG("* BYTE: 0x%02x", num);
+
             rar->cstate.window_buf[rar->cstate.write_ptr++ & rar->cstate.window_mask] = 
                 (uint8_t) num;
 
@@ -2304,9 +2345,10 @@ static int use_data(struct rar5* rar, const void** buf, size_t* size, int64_t* o
     for(i = 0; i < rar5_countof(rar->cstate.dready); i++) {
         struct data_ready *d = &rar->cstate.dready[i];
         if(d->used) {
-            *buf = d->buf;
-            *size = d->size;
-            *offset = d->offset;
+            if(buf)    *buf = d->buf;
+            if(size)   *size = d->size;
+            if(offset) *offset = d->offset;
+
             d->used = 0;
 
             update_crc(rar, d->buf, d->size);
@@ -2348,7 +2390,11 @@ static int do_uncompress_file(struct archive_read* a,
     int ret;
 
     if(!rar->cstate.initialized) {
-        init_unpack(rar);
+        if(!rar->main.solid || !rar->cstate.window_buf) {
+            LOG("*** init_unpack");
+            init_unpack(rar);
+        }
+
         rar->cstate.initialized = 1;
     }
 
@@ -2392,8 +2438,10 @@ static int do_uncompress_file(struct archive_read* a,
     ret = apply_filters(rar);
     if(ret == ARCHIVE_RETRY)
         return ARCHIVE_OK;
-    else if(ret == ARCHIVE_FATAL)
+    else if(ret == ARCHIVE_FATAL) {
+        LOG("apply_filters returned an error");
         return ARCHIVE_FATAL;
+    }
 
     // if ARCHIVE_OK, continue
 
@@ -2454,7 +2502,7 @@ static int do_unstore_file(struct archive_read* a,
         return ARCHIVE_FATAL;
     }
 
-    size_t to_read = rar5_min(rar->file.bytes_remaining, a->archive.read_data_requested);
+    size_t to_read = rar5_min(rar->file.bytes_remaining, 64 * 1024);
 
     if(!read_ahead(a, to_read, &p)) {
         LOG("I/O error during do_unstore_file");
@@ -2462,9 +2510,9 @@ static int do_unstore_file(struct archive_read* a,
         return ARCHIVE_FATAL;
     }
 
-    *buf = p;
-    *size = to_read;
-    *offset = rar->file.read_offset;
+    if(buf)    *buf = p;
+    if(size)   *size = to_read;
+    if(offset) *offset = rar->file.read_offset;
 
     rar->file.prev_read_bytes = to_read;
     rar->file.bytes_remaining -= to_read;
@@ -2525,9 +2573,14 @@ static int finalize_file(struct archive_read* a, struct rar5* rar) {
         if(rar->file.calculated_crc32 != rar->file.stored_crc32) {
             /* Checksums do not match; the unpacked file is corrupted. */
 
+            LOG("Checksum error: CRC32");
+#ifndef DONT_FAIL_ON_CRC_ERROR
             archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
                               "Checksum error: CRC32");
             return ARCHIVE_FATAL;
+#endif
+        } else {
+            LOG("Checksum OK: CRC32");
         }
     }
 
@@ -2549,10 +2602,15 @@ static int finalize_file(struct archive_read* a, struct rar5* rar) {
         (void) blake2sp_final(&rar->file.b2state, b2_buf, 32);
 
         if(memcmp(&rar->file.blake2sp, b2_buf, 32) != 0) {
+            LOG("Checksum error: BLAKE2sp");
+#ifndef DONT_FAIL_ON_CRC_ERROR
             archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
                               "Checksum error: BLAKE2");
 
             return ARCHIVE_FATAL;
+#endif
+        } else {
+            LOG("Checksum OK: BLAKE2sp");
         }
     }
 
@@ -2594,15 +2652,38 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
 static int rar5_read_data_skip(struct archive_read *a) {
     struct rar5* rar = get_context(a);
 
-    if(ARCHIVE_OK != consume(a, rar->file.bytes_remaining + rar->file.prev_read_bytes)) {
-        LOG("consume failed");
-        return ARCHIVE_FATAL;
+    if(rar->main.solid) {
+        /* In solid archives, instead of skipping data, we need to extract 
+         * it. */
+        
+        LOG("skipping solid: %ld bytes", rar->file.bytes_remaining);
+
+        int ret;
+
+        while(rar->file.bytes_remaining > 0) {
+            rar->skip_mode = 1;
+            ret = rar5_read_data(a, NULL, NULL, NULL);
+            rar->skip_mode = 0;
+
+            if(ret < 0) {
+                return ret;
+            }
+        }
+
+        return ARCHIVE_OK;
+    } else {
+        LOG("skipping non-solid: %ld bytes", rar->file.bytes_remaining);
+
+        if(ARCHIVE_OK != consume(a, rar->file.bytes_remaining + rar->file.prev_read_bytes)) {
+            LOG("consume failed");
+            return ARCHIVE_FATAL;
+        }
+
+        rar->file.prev_read_bytes = 0;
+        rar->file.bytes_remaining = 0;
+
+        return ARCHIVE_OK;
     }
-
-    rar->file.prev_read_bytes = 0;
-    rar->file.bytes_remaining = 0;
-
-    return ARCHIVE_OK;
 }
 
 static int64_t rar5_seek_data(struct archive_read *a, int64_t offset,
