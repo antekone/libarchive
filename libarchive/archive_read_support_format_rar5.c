@@ -54,9 +54,9 @@
 #define unused
 #endif
 
-#define DONT_FAIL_ON_CRC_ERROR
+#define CHECK_CRC_ON_SOLID_SKIP
 
-//#define SKIP_CRC_FAILURE
+// #define DONT_FAIL_ON_CRC_ERROR
 
 static int rar5_read_data_skip(struct archive_read *a);
 
@@ -348,8 +348,13 @@ static void write_filter_data(struct rar5* rar, uint32_t offset, uint32_t value)
 
 static void circular_memcpy(uint8_t* dst, uint8_t* window, const int mask, ssize_t start, ssize_t end) {
     if((start & mask) > (end & mask)) {
-        LOG("todo: start=0x%zx end=0x%zx", start, end);
-        exit(1);
+        ssize_t len1 = mask + 1 - start;
+        ssize_t len2 = end & mask;
+
+        LOG("todo: start=0x%zx end=0x%zx, len1=0x0x%08zx, len2=0x%08zx", start, end, len1, len2);
+
+        memcpy(dst, &window[start & mask], len1);
+        memcpy(dst + len1, window, len2);
     } else {
         memcpy(dst, &window[start & mask], (end - start) & mask);
     }
@@ -527,10 +532,10 @@ static int run_filter(struct rar5* rar, struct filter_info* flt) {
 static void push_data(struct rar5* rar, const uint8_t* buf, ssize_t idx_begin, ssize_t idx_end) {
     const int mask = rar->cstate.window_mask;
 
-    LOG("push_data: idx_begin=%x, idx_end=%x", idx_begin, idx_end);
+    LOG("push_data: idx_begin=%zx, idx_end=%zx", idx_begin, idx_end);
 
     if((idx_begin & mask) > (idx_end & mask)) {
-        ssize_t frag1_size = rar->cstate.window_size - (rar->cstate.solid_offset + rar->cstate.last_write_ptr & mask);
+        ssize_t frag1_size = rar->cstate.window_size - ((rar->cstate.solid_offset + rar->cstate.last_write_ptr) & mask);
         ssize_t frag2_size = (idx_end - idx_begin) - frag1_size;
 
         LOG("idx_begin=0x%zx, idx_end=0x%zx", idx_begin, idx_end);
@@ -538,7 +543,7 @@ static void push_data(struct rar5* rar, const uint8_t* buf, ssize_t idx_begin, s
         LOG("frag2_size=0x%zx", frag2_size);
 
         push_data_ready(rar,
-            buf + (rar->cstate.solid_offset + rar->cstate.last_write_ptr & mask),
+            buf + ((rar->cstate.solid_offset + rar->cstate.last_write_ptr) & mask),
             frag1_size,
             rar->cstate.last_write_ptr);
 
@@ -550,7 +555,7 @@ static void push_data(struct rar5* rar, const uint8_t* buf, ssize_t idx_begin, s
         rar->cstate.last_write_ptr += frag1_size + frag2_size;
     } else {
         push_data_ready(rar,
-            buf + (rar->cstate.solid_offset + rar->cstate.last_write_ptr & mask),
+            buf + ((rar->cstate.solid_offset + rar->cstate.last_write_ptr) & mask),
             idx_end - idx_begin,
             rar->cstate.last_write_ptr);
 
@@ -566,13 +571,13 @@ static int apply_filters(struct rar5* rar) {
     struct filter_info* flt;
     int ret;
 
-    LOG("processing filters, last_write_ptr=0x%zx, write_ptr=0x%zx", rar->cstate.last_write_ptr, rar->cstate.write_ptr);
+    /*LOG("processing filters, last_write_ptr=0x%zx, write_ptr=0x%zx", rar->cstate.last_write_ptr, rar->cstate.write_ptr);*/
 
     rar->cstate.all_filters_applied = 0;
     while(CDE_OK == cdeque_front(&rar->cstate.filters, cdeque_filter_p(&flt))) {
         if(rar->cstate.write_ptr > flt->block_start && rar->cstate.write_ptr >= flt->block_start + flt->block_length) {
             if(rar->cstate.last_write_ptr == flt->block_start) {
-                LOG("will process filter %d 0x%08x-0x%08x", flt->type, flt->block_start, flt->block_start + flt->block_length - 1);
+                /*LOG("will process filter %d 0x%08x-0x%08x", flt->type, flt->block_start, flt->block_start + flt->block_length - 1);*/
                 ret = run_filter(rar, flt);
                 if(ret != ARCHIVE_OK) {
                     LOG("filter failure, returning error");
@@ -583,12 +588,12 @@ static int apply_filters(struct rar5* rar) {
                 (void) cdeque_pop_front(&rar->cstate.filters, cdeque_filter_p(&flt));
                 return ARCHIVE_RETRY;
             } else {
-                LOG("not yet, will dump memory right before the filter");
+                /*LOG("not yet, will dump memory right before the filter");*/
                 push_window_data(rar, rar->cstate.last_write_ptr, flt->block_start);
                 return ARCHIVE_RETRY;
             }
         } else {
-            LOG("no, can't run this filter yet");
+            /*LOG("no, can't run this filter yet");*/
             break;
         }
     }
@@ -632,7 +637,7 @@ static void reset_file_context(struct rar5* rar) {
     memset(&rar->file, 0, sizeof(rar->file));
     
     if(rar->main.solid) {
-        rar->cstate.solid_offset = rar->cstate.write_ptr;
+        rar->cstate.solid_offset += rar->cstate.write_ptr;
     } else {
         rar->cstate.solid_offset = 0;
     }
@@ -642,11 +647,11 @@ static void reset_file_context(struct rar5* rar) {
     reset_filters(rar);
 }
 
-static int is_solid(struct rar5* rar) {
+unused static int is_solid(struct rar5* rar) {
     return (rar->cstate.flags & CIF_SOLID) > 0;
 }
 
-static void set_solid(struct rar5* rar, int flag) {
+unused static void set_solid(struct rar5* rar, int flag) {
     rar->cstate.flags |= flag ? CIF_SOLID : 0;
 }
 
@@ -1253,9 +1258,6 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
     rar->cstate.method = c_method;
     rar->cstate.version = c_version + 50;
 
-    /*LOG("window_size=%zu", rar->cstate.window_size);*/
-
-    LOG("compression_info: %08x", compression_info);
     set_solid(rar, (int) (compression_info & SOLID));
 
     if(!read_var_sized(a, &host_os, NULL))
@@ -1572,17 +1574,19 @@ static void init_unpack(struct rar5* rar) {
 }
 
 static void update_crc(struct rar5* rar, const uint8_t* p, size_t to_read) {
-    /* Don't update CRC32 if the file doesn't have the `stored_crc32` info
-       filled in. */
-    if(rar->file.stored_crc32 > 0) {
-        rar->file.calculated_crc32 = crc32(rar->file.calculated_crc32, p, to_read);
-    }
+    if(!rar->skip_mode) {
+        /* Don't update CRC32 if the file doesn't have the `stored_crc32` info
+           filled in. */
+        if(rar->file.stored_crc32 > 0) {
+            rar->file.calculated_crc32 = crc32(rar->file.calculated_crc32, p, to_read);
+        }
 
-    /* Check if the file uses an optional BLAKE2sp checksum algorithm. */
-    if(rar->file.has_blake2 > 0) {
-        /* Return value of the `update` function is always 0, so we can explicitly
-           ignore it here. */
-        (void) blake2sp_update(&rar->file.b2state, p, to_read);
+        /* Check if the file uses an optional BLAKE2sp checksum algorithm. */
+        if(rar->file.has_blake2 > 0) {
+            /* Return value of the `update` function is always 0, so we can explicitly
+               ignore it here. */
+            (void) blake2sp_update(&rar->file.b2state, p, to_read);
+        }
     }
 }
 
@@ -1857,13 +1861,13 @@ static int parse_tables(struct archive_read* a,
 
 static int parse_block_header(const uint8_t* p, ssize_t* block_size, struct compressed_block_header* hdr) {
     memcpy(hdr, p, sizeof(struct compressed_block_header));
-    LOG("parsing block header: ptr is %02x %02x %02x %02x", p[0], p[1], p[2], p[3]);
+    /*LOG("parsing block header: ptr is %02x %02x %02x %02x", p[0], p[1], p[2], p[3]);*/
     if(hdr->block_flags.byte_count == 3) {
         LOG("error: block header byte_count is %d", hdr->block_flags.byte_count);
         return ARCHIVE_FATAL;
     }
 
-    LOG("raw bytecount: %d", hdr->block_flags.byte_count);
+    /*LOG("raw bytecount: %d", hdr->block_flags.byte_count);*/
 
     // This should probably use bit reader interface in order to be more
     // future-proof.
@@ -2208,7 +2212,6 @@ static int do_uncompress_block(struct archive_read* a,
             continue;
         } else if(num == 256) {
             // Create a filter
-            int prev_addr = rar->bits.in_addr;
             ret = parse_filter(rar, p);
             if(ret != ARCHIVE_OK) {
                 LOG("filter parsing fail");
@@ -2361,8 +2364,8 @@ static int use_data(struct rar5* rar, const void** buf, size_t* size, int64_t* o
 
             update_crc(rar, d->buf, d->size);
 
-            LOG("using data: buf=%zx, size=%zx, offset=%lx", d->buf, d->size, d->offset);
-            LOG("window_buf:     %zx", &rar->cstate.window_buf[0]);
+            LOG("using data: buf=%zx, size=%zx, offset=%lx", (size_t) d->buf, d->size, d->offset);
+            LOG("window_buf:     %zx", (size_t) &rar->cstate.window_buf[0]);
             return ARCHIVE_OK;
         }
     }
@@ -2391,9 +2394,7 @@ static void push_data_ready(struct rar5* rar, const uint8_t* buf, size_t size, i
     exit(1);
 }
 
-static void dump_window_buf(struct rar5* rar) {
-    int col = 0;
-
+unused static void dump_window_buf(struct rar5* rar) {
     LOG("dumping window.bin");
     FILE* fw = fopen("window.bin", "wb");
     fwrite(rar->cstate.window_buf, rar->cstate.window_mask + 1, 1, fw);
@@ -2412,7 +2413,7 @@ static int do_uncompress_file(struct archive_read* a,
             init_unpack(rar);
         } else if(rar->main.solid) {
             LOG("*** solid init");
-            dump_window_buf(rar);
+            /*dump_window_buf(rar);*/
         }
 
         rar->cstate.code_seq = 0;
@@ -2574,6 +2575,8 @@ static int do_unpack(struct archive_read* a,
 }
 
 static int finalize_file(struct archive_read* a, struct rar5* rar) {
+    int verify_crc;
+
     /* Sanity checks. */
     
     if(rar->file.read_offset > rar->file.packed_size) {
@@ -2581,57 +2584,84 @@ static int finalize_file(struct archive_read* a, struct rar5* rar) {
         return ARCHIVE_FATAL;
     }
 
-    /* During unpacking, on each unpacked block we're calling the update_crc()
-     * function. Since we are here, the unpacking process is already over and
-     * we can check if calculated checksum (CRC32 or BLAKE2sp) is the same as
-     * what is stored in the archive
-     */
-    
-    if(rar->file.stored_crc32 > 0) {
-        /* Check CRC32 only when the file contains a CRC32 value for this 
-         * file. */
+    /* Check checksums only when actually unpacking the data. There's no need
+     * to calculate checksum when we're skipping data in solid archives
+     * (skipping in solid archives is the same thing as unpacking compressed
+     * data and discarding the result). */
 
-        if(rar->file.calculated_crc32 != rar->file.stored_crc32) {
-            /* Checksums do not match; the unpacked file is corrupted. */
+    if(!rar->skip_mode) {
+        /* Always check checkums if we're not in skip mode */
+        verify_crc = 1;
+    } else {
+        /* We can override the logic above with a compile-time option
+         * NO_CRC_ON_SOLID_SKIP. This option is used during debugging, and it
+         * will check checksums of unpacked data even when we're skipping it.
+         */
 
-            LOG("Checksum error: CRC32");
-#ifndef DONT_FAIL_ON_CRC_ERROR
-            archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
-                              "Checksum error: CRC32");
-            return ARCHIVE_FATAL;
+#if defined CHECK_CRC_ON_SOLID_SKIP
+        /* Debug case */
+        verify_crc = 1;
+#else
+        /* Normal case */
+        verify_crc = 0;
 #endif
-        } else {
-            LOG("Checksum OK: CRC32");
-        }
     }
+    
+    if(verify_crc) {
+        /* During unpacking, on each unpacked block we're calling the
+         * update_crc() function. Since we are here, the unpacking process is
+         * already over and we can check if calculated checksum (CRC32 or
+         * BLAKE2sp) is the same as what is stored in the archive.
+         */
+        if(rar->file.stored_crc32 > 0) {
+            /* Check CRC32 only when the file contains a CRC32 value for this
+             * file. */
 
-    if(rar->file.has_blake2 > 0) {
-        /* BLAKE2sp is an optional checksum algorithm that is added to RARv5 
-         * archives when using the `-htb` switch during creation of archive.
-         *
-         * We now finalize the hash calculation by calling the `final`
-         * function. This will generate the final hash value we can use
-         * to compare it with the BLAKE2sp checksum that is stored in the
-         * archive. 
-         *
-         * The return value of this `final` function is not very helpful,
-         * as it guards only against improper use. This is why we're
-         * explicitly ignoring it. */
+            if(rar->file.calculated_crc32 != rar->file.stored_crc32) {
+                /* Checksums do not match; the unpacked file is corrupted. */
 
-        uint8_t b2_buf[32];
-
-        (void) blake2sp_final(&rar->file.b2state, b2_buf, 32);
-
-        if(memcmp(&rar->file.blake2sp, b2_buf, 32) != 0) {
-            LOG("Checksum error: BLAKE2sp");
+                LOG("Checksum error: CRC32");
 #ifndef DONT_FAIL_ON_CRC_ERROR
-            archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
-                              "Checksum error: BLAKE2");
-
-            return ARCHIVE_FATAL;
+                archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                                  "Checksum error: CRC32");
+                return ARCHIVE_FATAL;
 #endif
-        } else {
-            LOG("Checksum OK: BLAKE2sp");
+            } else {
+                LOG("Checksum OK: CRC32 (%08x/%08x)",
+                    rar->file.stored_crc32,
+                    rar->file.calculated_crc32);
+            }
+        }
+
+        if(rar->file.has_blake2 > 0) {
+            /* BLAKE2sp is an optional checksum algorithm that is added to
+             * RARv5 archives when using the `-htb` switch during creation of
+             * archive.
+             *
+             * We now finalize the hash calculation by calling the `final`
+             * function. This will generate the final hash value we can use to
+             * compare it with the BLAKE2sp checksum that is stored in the
+             * archive. 
+             *
+             * The return value of this `final` function is not very helpful,
+             * as it guards only against improper use. This is why we're
+             * explicitly ignoring it. */
+
+            uint8_t b2_buf[32];
+
+            (void) blake2sp_final(&rar->file.b2state, b2_buf, 32);
+
+            if(memcmp(&rar->file.blake2sp, b2_buf, 32) != 0) {
+                LOG("Checksum error: BLAKE2sp");
+#ifndef DONT_FAIL_ON_CRC_ERROR
+                archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                                  "Checksum error: BLAKE2");
+
+                return ARCHIVE_FATAL;
+#endif
+            } else {
+                LOG("Checksum OK: BLAKE2sp");
+            }
         }
     }
 
@@ -2683,9 +2713,7 @@ static int rar5_read_data_skip(struct archive_read *a) {
 
         while(rar->file.bytes_remaining > 0) {
             rar->skip_mode = 1;
-            LOG("enabling skip_mode");
             ret = rar5_read_data(a, NULL, NULL, NULL);
-            LOG("disabling skip_mode");
             rar->skip_mode = 0;
 
             if(ret < 0) {
