@@ -55,7 +55,7 @@
 #endif
 
 // #define CHECK_CRC_ON_SOLID_SKIP
-// #define DONT_FAIL_ON_CRC_ERROR
+ #define DONT_FAIL_ON_CRC_ERROR
 
 static int rar5_read_data_skip(struct archive_read *a);
 
@@ -68,6 +68,7 @@ struct file_header {
     uint64_t read_offset; // offset in the compressed stream
     uint64_t write_offset; // offset in the output stream
     uint64_t prev_read_bytes;
+    size_t crc_sum;
 
     // optional time fields
     uint64_t e_mtime;
@@ -1562,6 +1563,8 @@ static void update_crc(struct rar5* rar, const uint8_t* p, size_t to_read) {
            filled in. */
         if(rar->file.stored_crc32 > 0) {
             rar->file.calculated_crc32 = crc32(rar->file.calculated_crc32, p, to_read);
+            rar->file.crc_sum += to_read;
+            LOG("update_crc: to_read=0x%zx, crc_sum=%zu", to_read, rar->file.crc_sum);
         }
 
         /* Check if the file uses an optional BLAKE2sp checksum algorithm. */
@@ -1885,7 +1888,7 @@ static int parse_block_header(const uint8_t* p, ssize_t* block_size, struct comp
         /*LOG("Block header checksum ok");*/
     }
 
-    /*LOG("hdr=%p, block header last? %d, tables? %d", hdr, hdr->block_flags.is_last_block, hdr->block_flags.is_table_present);*/
+    LOG("hdr=%p, block header last? %d, tables? %d", hdr, hdr->block_flags.is_last_block, hdr->block_flags.is_table_present);
     return ARCHIVE_OK;
 }
 
@@ -2340,8 +2343,7 @@ static int use_data(struct rar5* rar, const void** buf, size_t* size, int64_t* o
 
             update_crc(rar, d->buf, d->size);
 
-            /*LOG("using data: buf=%zx, size=%zx, offset=%lx", (size_t) d->buf, d->size, d->offset);*/
-            /*LOG("window_buf:     %zx", (size_t) &rar->cstate.window_buf[0]);*/
+            LOG("using data: buf=%zx, size=%zx, offset=%lx", (size_t) d->buf, d->size, d->offset);
             return ARCHIVE_OK;
         }
     }
@@ -2594,7 +2596,9 @@ static int finalize_file(struct archive_read* a, struct rar5* rar) {
             if(rar->file.calculated_crc32 != rar->file.stored_crc32) {
                 /* Checksums do not match; the unpacked file is corrupted. */
 
-                LOG("Checksum error: CRC32");
+                LOG("Checksum error: CRC32 (was: %08x, expected: %08x)",
+                    rar->file.calculated_crc32, rar->file.stored_crc32);
+
 #ifndef DONT_FAIL_ON_CRC_ERROR
                 archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
                                   "Checksum error: CRC32");
