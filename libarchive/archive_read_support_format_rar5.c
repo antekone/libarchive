@@ -68,6 +68,8 @@ struct file_header {
     uint64_t read_offset; // offset in the compressed stream
     uint64_t write_offset; // offset in the output stream
     uint64_t prev_read_bytes;
+    uint64_t last_offset;
+    uint64_t last_size;
     size_t crc_sum;
 
     // optional time fields
@@ -400,6 +402,7 @@ static int run_delta_filter(struct rar5* rar, struct filter_info* flt) {
     // maybe move it to some common place so it's executed automatically?
     push_data_ready(rar, rar->cstate.filtered_buf, flt->block_length, rar->cstate.last_write_ptr);
     rar->cstate.last_write_ptr += flt->block_length;
+    LOG("new last_write_ptr=%lx", rar->cstate.last_write_ptr);
 
     return ARCHIVE_OK;
 }
@@ -455,6 +458,7 @@ static int run_e8e9_filter(struct rar5* rar, struct filter_info* flt, int extend
     // maybe move it to some common place so it's executed automatically?
     push_data_ready(rar, rar->cstate.filtered_buf, flt->block_length, rar->cstate.last_write_ptr);
     rar->cstate.last_write_ptr += flt->block_length;
+    LOG("new last_write_ptr=%lx", rar->cstate.last_write_ptr);
 
     return ARCHIVE_OK;
 }
@@ -484,6 +488,7 @@ static int run_arm_filter(struct rar5* rar, struct filter_info* flt) {
     // maybe move it to some common place so it's executed automatically?
     push_data_ready(rar, rar->cstate.filtered_buf, flt->block_length, rar->cstate.last_write_ptr);
     rar->cstate.last_write_ptr += flt->block_length;
+    LOG("new last_write_ptr=%lx", rar->cstate.last_write_ptr);
 
     return ARCHIVE_OK;
 }
@@ -530,19 +535,24 @@ static int run_filter(struct rar5* rar, struct filter_info* flt) {
 static void push_data(struct rar5* rar, const uint8_t* buf, ssize_t idx_begin, ssize_t idx_end) {
     const int mask = rar->cstate.window_mask;
 
-    /*LOG("push_data: idx_begin=%zx, idx_end=%zx", idx_begin, idx_end);*/
+    LOG("push_data: idx_begin=%zx, idx_end=%zx", idx_begin, idx_end);
 
     if((idx_begin & mask) > (idx_end & mask)) {
-        ssize_t frag1_size = rar->cstate.window_size - ((rar->cstate.solid_offset + rar->cstate.last_write_ptr) & mask);
-        ssize_t frag2_size = idx_end & rar->cstate.window_mask;
+        ssize_t frag1_size = rar->cstate.window_size - ((rar->cstate.solid_offset + idx_begin) & mask);
+        ssize_t frag2_size = (rar->cstate.solid_offset + idx_end) & mask;
+
+        ssize_t src_offset_1 = (rar->cstate.solid_offset + rar->cstate.last_write_ptr) & mask;
+        ssize_t src_offset_2 = rar->cstate.solid_offset & mask;
+
+        LOG("push_data: src_offset_1=%zx, src_offset2=%zx", src_offset_1, src_offset_2);
 
         push_data_ready(rar,
-            buf + ((rar->cstate.solid_offset + rar->cstate.last_write_ptr) & mask),
+            buf + src_offset_1,
             frag1_size,
             rar->cstate.last_write_ptr);
 
         push_data_ready(rar,
-            buf + rar->cstate.solid_offset,
+            buf + (rar->cstate.solid_offset & mask),
             frag2_size,
             rar->cstate.last_write_ptr + frag1_size);
 
@@ -565,29 +575,29 @@ static int apply_filters(struct rar5* rar) {
     struct filter_info* flt;
     int ret;
 
-    /*LOG("processing filters, last_write_ptr=0x%zx, write_ptr=0x%zx", rar->cstate.last_write_ptr, rar->cstate.write_ptr);*/
+    LOG("processing filters, last_write_ptr=0x%zx, write_ptr=0x%zx", rar->cstate.last_write_ptr, rar->cstate.write_ptr);
 
     rar->cstate.all_filters_applied = 0;
     while(CDE_OK == cdeque_front(&rar->cstate.filters, cdeque_filter_p(&flt))) {
         if(rar->cstate.write_ptr > flt->block_start && rar->cstate.write_ptr >= flt->block_start + flt->block_length) {
             if(rar->cstate.last_write_ptr == flt->block_start) {
-                /*LOG("will process filter %d 0x%08x-0x%08x", flt->type, flt->block_start, flt->block_start + flt->block_length - 1);*/
+                LOG("will process filter %d 0x%08x-0x%08x", flt->type, flt->block_start, flt->block_start + flt->block_length - 1);
                 ret = run_filter(rar, flt);
                 if(ret != ARCHIVE_OK) {
                     LOG("filter failure, returning error");
                     return ret;
                 }
 
-                /*LOG("filter executed, removing it from queue");*/
+                LOG("filter executed, removing it from queue");
                 (void) cdeque_pop_front(&rar->cstate.filters, cdeque_filter_p(&flt));
                 return ARCHIVE_RETRY;
             } else {
-                /*LOG("not yet, will dump memory right before the filter");*/
+                LOG("not yet, will dump memory right before the filter");
                 push_window_data(rar, rar->cstate.last_write_ptr, flt->block_start);
                 return ARCHIVE_RETRY;
             }
         } else {
-            /*LOG("no, can't run this filter yet");*/
+            LOG("no, can't run this filter yet");
             break;
         }
     }
@@ -1453,7 +1463,7 @@ static int process_base_block(struct archive_read* a, struct rar5* rar, struct a
         HEAD_CRYPT = 0x04, HEAD_ENDARC = 0x05, HEAD_UNKNOWN = 0xff,
     };
 
-    /*LOG("header_id=%02lx", header_id);*/
+    LOG("header_id=%02lx", header_id);
     switch(header_id) {
         case HEAD_MAIN:
             ret = process_head_main(a, rar, entry, header_flags);
@@ -1475,7 +1485,11 @@ static int process_base_block(struct archive_read* a, struct rar5* rar, struct a
         case HEAD_CRYPT:
             return ARCHIVE_FATAL;
         case HEAD_ENDARC:
-            return ARCHIVE_FATAL;
+            return ARCHIVE_EOF;
+        case HEAD_MARK:
+            // TODO check if returning EOF on HEAD_MARK is really a proper
+            // thing to do
+            return ARCHIVE_EOF;
         default:
             if((header_flags & HFL_SKIP_IF_UNKNOWN) == 0) {
                 archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT, "Header type error");
@@ -1564,7 +1578,7 @@ static void update_crc(struct rar5* rar, const uint8_t* p, size_t to_read) {
         if(rar->file.stored_crc32 > 0) {
             rar->file.calculated_crc32 = crc32(rar->file.calculated_crc32, p, to_read);
             rar->file.crc_sum += to_read;
-            LOG("update_crc: to_read=0x%zx, crc_sum=%zu", to_read, rar->file.crc_sum);
+            /*LOG("update_crc: to_read=0x%zx, crc_sum=%zx", to_read, rar->file.crc_sum);*/
         }
 
         /* Check if the file uses an optional BLAKE2sp checksum algorithm. */
@@ -2341,9 +2355,8 @@ static int use_data(struct rar5* rar, const void** buf, size_t* size, int64_t* o
 
             d->used = 0;
 
+            LOG("using data: buf=%zx, size=%zx, offset=%lx (new -> %lx)", (size_t) d->buf, d->size, d->offset, d->offset + d->size);
             update_crc(rar, d->buf, d->size);
-
-            LOG("using data: buf=%zx, size=%zx, offset=%lx", (size_t) d->buf, d->size, d->offset);
             return ARCHIVE_OK;
         }
     }
@@ -2354,8 +2367,15 @@ static int use_data(struct rar5* rar, const void** buf, size_t* size, int64_t* o
 static void push_data_ready(struct rar5* rar, const uint8_t* buf, size_t size, int64_t offset) {
     int i;
 
-    /*unused ssize_t b = (ssize_t) buf - (ssize_t) rar->cstate.window_buf;*/
-    /*LOG("pushing data ready: buf=%zx, size=%zx, offset=%lx", b, size, offset);*/
+    if(offset != rar->file.last_offset + rar->file.last_size) {
+        LOG("sanity check error; output data stream is not continuous");
+        LOG("offset=%lx, last_offset=%lx, last_size=%lx", offset,
+            rar->file.last_offset, rar->file.last_size);
+        exit(1);
+    }
+
+    unused ssize_t b = (ssize_t) buf - (ssize_t) rar->cstate.window_buf;
+    LOG("pushing data ready: buf=%zx, size=%zx, offset=%lx", b, size, offset);
 
     for(i = 0; i < rar5_countof(rar->cstate.dready); i++) {
         struct data_ready* d = &rar->cstate.dready[i];
@@ -2364,6 +2384,8 @@ static void push_data_ready(struct rar5* rar, const uint8_t* buf, size_t size, i
             d->buf = buf;
             d->size = size;
             d->offset = offset;
+            rar->file.last_offset = offset;
+            rar->file.last_size = size;
             return;
         }
     }
@@ -2446,7 +2468,7 @@ static int do_uncompress_file(struct archive_read* a,
     ssize_t max_end_pos;
 
     if(cdeque_size(&rar->cstate.filters) > 0) {
-        /*LOG("checking if we can write something before hitting first filter...");*/
+        LOG("checking if we can write something before hitting first filter...");
         struct filter_info* flt;
         if(CDE_OK != cdeque_front(&rar->cstate.filters, cdeque_filter_p(&flt))) {
             LOG("internal error, can't read first filter");
@@ -2455,20 +2477,21 @@ static int do_uncompress_file(struct archive_read* a,
 
         max_end_pos = rar5_min(flt->block_start, rar->cstate.write_ptr);
     } else {
-        // no filters, we just dump the data and we're happy
+        LOG("no filters, just dump the data and we're happy");
         max_end_pos = rar->cstate.write_ptr;
     }
 
     if(max_end_pos == rar->cstate.last_write_ptr) {
         // can't write anything... ;(
-        /*LOG("can't write anything, we have to loop, return 0 bytes or retry request");*/
-        /*LOG("we're standing on 0x%08zx, last generated byte is 0x%08zx", rar->cstate.last_write_ptr,*/
-                /*rar->cstate.write_ptr);*/
+        LOG("can't write anything, we have to loop, return 0 bytes or retry request");
+        LOG("we're standing on 0x%08zx, last generated byte is 0x%08zx", rar->cstate.last_write_ptr,
+                rar->cstate.write_ptr);
         return ARCHIVE_RETRY;
     } else {
-        // can write something before hitting first filter. do it now.
+        LOG("can write something before hitting first filter. do it now.");
         push_window_data(rar, rar->cstate.last_write_ptr, max_end_pos);
         rar->cstate.last_write_ptr = max_end_pos;
+        LOG("new last_write_ptr=%lx", rar->cstate.last_write_ptr);
     }
 
     return ARCHIVE_OK;
