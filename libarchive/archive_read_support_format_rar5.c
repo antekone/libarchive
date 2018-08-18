@@ -59,26 +59,29 @@
 
 static int rar5_read_data_skip(struct archive_read *a);
 
-struct file_header {
-    uint32_t stored_crc32;
-    uint32_t calculated_crc32;
-    uint64_t unpacked_size;
-    uint64_t packed_size;
-    uint64_t bytes_remaining;
-    uint64_t read_offset; // offset in the compressed stream
-    uint64_t write_offset; // offset in the output stream
-    uint64_t prev_read_bytes;
-    uint64_t last_offset;
-    uint64_t last_size;
-    size_t crc_sum;
+/*
+ * TODO: check a situation where we read 1 chunk of data, and we skip the rest.
+ *       - for compressed nonsolid archives
+ *       - for compressed solid archives
+ *       - for stored archives
+ */
 
-    // optional time fields
+struct file_header {
+    uint64_t bytes_remaining;
+    uint64_t read_offset;        /* used during extraction of stored files */
+    uint64_t prev_read_bytes;
+    int64_t last_offset;         /* used in sanity checks */
+    int64_t last_size;           /* used in sanity checks */
+
+    /* optional time fields */
     uint64_t e_mtime;
     uint64_t e_ctime;
     uint64_t e_atime;
     uint32_t e_unix_ns;
 
-    // optional hash fields
+    /* optional hash fields */
+    uint32_t stored_crc32;
+    uint32_t calculated_crc32;
     uint8_t blake2sp[32];
     blake2sp_state b2state;
     char has_blake2;
@@ -121,14 +124,10 @@ struct decode_table {
 struct filter_info {
     int type;
     int channels;
-    int id;
+    int pos_r;
 
-    int next_window : 1;
-    int pos_r : 2;
-
-    // TODO: those types should be int64_t?
-    uint32_t block_start;
-    uint32_t block_length;
+    int64_t block_start;
+    int64_t block_length;
     uint16_t width;
     uint32_t orig_block_start;
 };
@@ -150,7 +149,6 @@ struct cdeque {
 
 struct comp_state {
     int initialized : 1;
-
     int flags;
     int method;
     int version;
@@ -159,37 +157,40 @@ struct comp_state {
     uint8_t* filtered_buf;
     const uint8_t* block_buf;
     size_t window_mask;
-    ssize_t write_ptr;
-    ssize_t last_write_ptr;
-    ssize_t solid_offset;
-    ssize_t unpacked_bytes;
+
+    int64_t write_ptr;
+    int64_t last_write_ptr;
+
+    int64_t solid_offset;
     ssize_t cur_block_size;
-    int block_num;
-    int computed_block_size;
     int last_len;
     int block_parsing_finished;
-    int code_seq;
-    int window_flip_count;
     int all_filters_applied;
 
+    /* Decode tables used during lzss uncompression. */
     struct decode_table bd;
     struct decode_table ld;
     struct decode_table dd;
     struct decode_table ldd;
     struct decode_table rd;
 
+    /* Circular deque for storing filters. */
     struct cdeque filters;
+
+    /* Distance cache used during lzss uncompression. */
     int dist_cache[4];
-    // TODO: convert this to cdeque
+
+    /* Data buffer stack. */
     struct data_ready dready[2];
-    int filter_count;
 };
 
+/* Bit reader state. */
 struct bit_reader {
-    int bit_addr;
-    int in_addr;
+    int8_t bit_addr;    /* Current bit pointer inside current byte. */
+    int in_addr;        /* Current byte pointer. */
 };
 
+/* RARv5 block header structure. */
 struct compressed_block_header { 
     union {
         struct {
@@ -204,24 +205,50 @@ struct compressed_block_header {
     uint8_t block_cksum;
 };
 
+/* RARv5 main header structure. */
 struct main_header {
+    /* Does the archive contain solid streams? */
     uint8_t solid : 1;
+
+    /* If this a multi-file archive? */
     uint8_t volume : 1;
+
     uint8_t notused : 6;
 };
 
+/* Main context structure. */
 struct rar5 {
     int header_initialized;
+
+    /* Set to 1 if current file is positioned AFTER the magic value
+     * of the archive file. This is used in header reading functions. */
     int skipped_magic;
+
+    /* Set to 1 if we're in skip mode (either by calling rar5_data_skip
+     * function or when skipping over solid streams). Set to 0 when in
+     * extraction mode. This is used during checksum calculation functions. */
     int skip_mode;
 
-    uint64_t qlist_offset;    // not used by this unpacker
-    uint64_t rr_offset;       // not used by this unpacker
+    /* An offset to QuickOpen list. This is not supported by this unpacker,
+     * becuase we're focusing on streaming interface. QuickOpen is designed
+     * to make things quicker for non-stream interfaces, so it's not our
+     * use case. */
+    int64_t qlist_offset;
 
+    /* An offset to additional Recovery data. This is not supported by this
+     * unpacker. Recovery data are additional Reed-Solomon codes that could
+     * be used to calculate bytes that are missing in archive or are
+     * corrupted. */
+    int64_t rr_offset;   
+
+    /* Various context variables grouped to different structures. */
     struct main_header main;
     struct comp_state cstate;
     struct file_header file;
     struct bit_reader bits;
+
+    /* The header of currently processed RARv5 block. Used in main
+     * decompression logic loop. */
     struct compressed_block_header last_block_hdr;
 };
 
@@ -232,22 +259,21 @@ struct rar5 {
 #define UNUSED(x) (void) (x)
 #define LOG(...)  do { printf(__VA_ARGS__); puts(""); } while(0)
 
-/* CDE_xxx = Circular Double Ended (Queue) xxx */
+/* CDE_xxx = Circular Double Ended (Queue) return values. */
 enum CDE_RETURN_VALUES {
     CDE_OK, CDE_ALLOC, CDE_PARAM, CDE_OUT_OF_BOUNDS,
 };
 
-struct cdeque_iter {
-    int index;
-};
-
+/* Clears the contents of this circular deque. */
 static void cdeque_clear(struct cdeque* d) {
     d->size = 0;
     d->beg_pos = 0;
     d->end_pos = 0;
 }
 
-// capacity must be power of 2: 8, 16, 32, 64, 256, etc.
+/* Creates a new circular deque object. Capacity must be power of 2: 8, 16, 32,
+ * 64, 256, etc. When the user will add another item above current capacity,
+ * the circular deque will overwrite the oldest entry. */
 static int cdeque_init(struct cdeque* d, int max_capacity_power_of_2) {
     if(d == NULL || max_capacity_power_of_2 == 0) 
         return CDE_PARAM;
@@ -264,14 +290,20 @@ static int cdeque_init(struct cdeque* d, int max_capacity_power_of_2) {
     return d->arr ? CDE_OK : CDE_ALLOC;
 }
 
+/* Return the current size (not capacity) of circular deque `d`. */
 static size_t cdeque_size(struct cdeque* d) {
     return d->size;
 }
 
+/* Returns the first element of current circular deque. Note that this function
+ * doesn't perform any bounds checking. If you need bounds checking, use
+ * `cdeque_front()` function instead. */
 static void cdeque_front_fast(struct cdeque* d, void** value) {
     *value = (void*) d->arr[d->beg_pos];
 }
 
+/* Returns the first element of current circular deque. This function
+ * performs bounds checking. */
 static int cdeque_front(struct cdeque* d, void** value) {
     if(d->size > 0) {
         cdeque_front_fast(d, value);
@@ -280,6 +312,8 @@ static int cdeque_front(struct cdeque* d, void** value) {
         return CDE_OUT_OF_BOUNDS;
 }
 
+/* Pushes a new element into the end of this circular deque object. If current
+ * size will exceed capacity, the oldest element will be overwritten. */
 static int cdeque_push_back(struct cdeque* d, void* item) {
     if(d == NULL) 
         return CDE_PARAM;
@@ -294,12 +328,16 @@ static int cdeque_push_back(struct cdeque* d, void* item) {
     return CDE_OK;
 }
 
+/* Pops a front element of this circular deque object and returns its value.
+ * This function doesn't perform any bounds checking. */
 static void cdeque_pop_front_fast(struct cdeque* d, void** value) {
     *value = (void*) d->arr[d->beg_pos];
     d->beg_pos = (d->beg_pos + 1) & d->cap_mask;
     d->size--;
 }
 
+/* Pops a front element of this cicrular deque object and returns its value.
+ * This function performs bounds checking. */
 static int cdeque_pop_front(struct cdeque* d, void** value) {
     if(!d || !value) 
         return CDE_PARAM;
@@ -311,14 +349,19 @@ static int cdeque_pop_front(struct cdeque* d, void** value) {
     return CDE_OK;
 }
 
+/* Convinience function to cast filter_info** to void **. */
 static void** cdeque_filter_p(struct filter_info** f) {
     return (void**) (size_t) f;
 }
 
+/* Convinience function to cast filter_info* to void *. */
 static void* cdeque_filter(struct filter_info* f) {
     return (void**) (size_t) f;
 }
 
+/* Destroys this circular deque object. Dellocates the memory of the collection
+ * buffer, but doesn't deallocate the memory of any pointer passed to this
+ * deque as a value. */
 static void cdeque_free(struct cdeque* d) {
     if(!d)
         return;
@@ -335,6 +378,8 @@ static void cdeque_free(struct cdeque* d) {
 }
 
 // TODO: make sure these functions return a little endian number 
+
+/* Convinience functions used by filter implementations. */
 
 static uint32_t read_filter_data(struct rar5* rar, uint32_t offset) {
     uint32_t* dptr = (uint32_t*) &rar->cstate.window_buf[offset];
@@ -365,8 +410,6 @@ static struct filter_info* add_new_filter(struct rar5* rar) {
         (struct filter_info*) calloc(1, sizeof(struct filter_info));
 
     cdeque_push_back(&rar->cstate.filters, cdeque_filter(f));
-
-    f->id = rar->cstate.filter_count;
     return f;
 }
 
@@ -633,8 +676,6 @@ static int rar5_init(struct rar5* rar) {
     return ARCHIVE_OK;
 }
 
-static void reset_filters(struct rar5* rar);
-
 static void reset_file_context(struct rar5* rar) {
     memset(&rar->file, 0, sizeof(rar->file));
     
@@ -646,7 +687,8 @@ static void reset_file_context(struct rar5* rar) {
 
     rar->cstate.write_ptr = 0;
     rar->cstate.last_write_ptr = 0;
-    reset_filters(rar);
+
+    cdeque_clear(&rar->cstate.filters);
 }
 
 unused static int is_solid(struct rar5* rar) {
@@ -917,8 +959,6 @@ static int rar5_options(struct archive_read *a, const char *key, const char *val
 }
 
 static void init_header(struct archive_read* a, struct rar5* rar) {
-    UNUSED(rar);
-
     a->archive.archive_format = ARCHIVE_FORMAT_RAR_V5;
     a->archive.archive_format_name = "RAR5";
 }
@@ -1160,16 +1200,12 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
 
     reset_file_context(rar);
 
-    /*LOG("processing file header");*/
-
     if(block_flags & HFL_EXTRA_DATA) {
-        /*LOG("extra data is present here");*/
-
         size_t edata_size;
         if(!read_var_sized(a, &edata_size, NULL))
             return ARCHIVE_EOF;
 
-        // intentional type cast from unsigned to signed
+        /* Intentional type cast from unsigned to signed. */
         extra_data_size = (ssize_t) edata_size;
     }
 
@@ -1177,11 +1213,8 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
         if(!read_var_sized(a, &data_size, NULL))
             return ARCHIVE_EOF;
 
-        rar->file.packed_size = data_size;
-        rar->file.bytes_remaining = rar->file.packed_size;
-        /*LOG("data size: 0x%08zx", data_size);*/
+        rar->file.bytes_remaining = data_size;
     } else {
-        rar->file.packed_size = 0;
         rar->file.bytes_remaining = 0;
 
         LOG("*** FILE/SERVICE block without data, failing");
@@ -1209,7 +1242,6 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
     }
 
     is_dir = (int) (file_flags & DIRECTORY);
-    rar->file.unpacked_size = unpacked_size;
 
     if(!read_var_sized(a, &file_attr, NULL))
         return ARCHIVE_EOF;
@@ -1300,7 +1332,6 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
     archive_entry_update_pathname_utf8(entry, name_utf8_buf);
     rar->cstate.block_parsing_finished = 1;
     rar->cstate.all_filters_applied = 1;
-    rar->cstate.unpacked_bytes = 0;
     rar->cstate.initialized = 0;
 
     return ARCHIVE_OK;
@@ -1530,10 +1561,6 @@ static int rar5_read_header(struct archive_read *a, struct archive_entry *entry)
     return ret;
 }
 
-static void reset_filters(struct rar5* rar) {
-    cdeque_clear(&rar->cstate.filters);
-}
-
 static void init_unpack(struct rar5* rar) {
     rar->file.calculated_crc32 = 0;
     rar->file.read_offset = 0;
@@ -1575,8 +1602,6 @@ static void update_crc(struct rar5* rar, const uint8_t* p, size_t to_read) {
            filled in. */
         if(rar->file.stored_crc32 > 0) {
             rar->file.calculated_crc32 = crc32(rar->file.calculated_crc32, p, to_read);
-            rar->file.crc_sum += to_read;
-            /*LOG("update_crc: to_read=0x%zx, crc_sum=%zx", to_read, rar->file.crc_sum);*/
         }
 
         /* Check if the file uses an optional BLAKE2sp checksum algorithm. */
@@ -2021,7 +2046,7 @@ static int decode_code_length(struct rar5* rar, const uint8_t* p, uint16_t code)
     return length;
 }
 
-static int copy_string(struct rar5* rar, int len, int dist, int noisy) {
+static int copy_string(struct rar5* rar, int len, int dist, unused int noisy) {
     ssize_t write_ptr = rar->cstate.write_ptr + rar->cstate.solid_offset;
     int i;
 
@@ -2083,9 +2108,6 @@ static int do_uncompress_block(struct archive_read* a,
             }
         }
 
-        rar->cstate.code_seq++;
-
-        /*LOG("(addr=%d, bit=%d, cbs=%d)", rar->bits.in_addr, rar->bits.bit_addr, rar->cstate.computed_block_size);*/
         if(ARCHIVE_OK != decode_number(a, rar, &rar->cstate.ld, p, &num)) {
             LOG("fail in decode_number");
             return ARCHIVE_EOF;
@@ -2307,9 +2329,6 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
 
         rar->cstate.block_buf = p;
         rar->cstate.cur_block_size = block_size;
-        rar->cstate.block_num++;
-        //rar->cstate.code_seq = 0;
-        rar->cstate.computed_block_size = to_skip;
 
         rar->bits.in_addr = 0;
         rar->bits.bit_addr = 0;
@@ -2408,7 +2427,6 @@ unused static void dump_window_buf(struct rar5* rar) {
 static int do_uncompress_file(struct archive_read* a,
                            struct rar5* rar)
 {
-    const size_t mask = rar->cstate.window_mask;
     int ret;
 
     if(!rar->cstate.initialized) {
@@ -2418,7 +2436,6 @@ static int do_uncompress_file(struct archive_read* a,
             /* ... */
         }
 
-        rar->cstate.code_seq = 0;
         rar->cstate.initialized = 1;
     }
 
@@ -2449,13 +2466,6 @@ static int do_uncompress_file(struct archive_read* a,
             }
 
             break;
-        }
-
-        // There shouldn't be a situation where 1 block will write more data than
-        // the size of the window, because the `process_block` function limits the
-        // data than can be generated. 
-        if((rar->cstate.last_write_ptr & mask) > (rar->cstate.write_ptr & mask)) {
-            rar->cstate.window_flip_count++;
         }
     }
 
@@ -2578,13 +2588,6 @@ static int do_unpack(struct archive_read* a,
 
 static int finalize_file(struct archive_read* a, struct rar5* rar) {
     int verify_crc;
-
-    /* Sanity checks. */
-    
-    if(rar->file.read_offset > rar->file.packed_size) {
-        LOG("something is wrong: offset is bigger than packed size");
-        return ARCHIVE_FATAL;
-    }
 
     /* Check checksums only when actually unpacking the data. There's no need
      * to calculate checksum when we're skipping data in solid archives
@@ -2766,9 +2769,13 @@ static int rar5_cleanup(struct archive_read *a)
 {
     struct rar5* rar = get_context(a);
 
-    free(rar->cstate.window_buf);
-    free(rar->cstate.filtered_buf);
-    reset_filters(rar);
+    if(rar->cstate.window_buf)
+        free(rar->cstate.window_buf);
+
+    if(rar->cstate.filtered_buf)
+        free(rar->cstate.filtered_buf);
+
+    cdeque_clear(&rar->cstate.filters);
     cdeque_free(&rar->cstate.filters);
     free(rar);
     a->format->data = NULL;
