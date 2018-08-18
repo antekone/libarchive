@@ -55,7 +55,7 @@
 #endif
 
 // #define CHECK_CRC_ON_SOLID_SKIP
- #define DONT_FAIL_ON_CRC_ERROR
+// #define DONT_FAIL_ON_CRC_ERROR
 
 static int rar5_read_data_skip(struct archive_read *a);
 
@@ -534,9 +534,12 @@ static void push_data(struct rar5* rar, const uint8_t* buf, ssize_t idx_begin, s
 
     /*LOG("push_data: idx_begin=%zx, idx_end=%zx", idx_begin, idx_end);*/
 
+    idx_begin += rar->cstate.solid_offset;
+    idx_end += rar->cstate.solid_offset;
+
     if((idx_begin & mask) > (idx_end & mask)) {
-        ssize_t frag1_size = rar->cstate.window_size - ((rar->cstate.solid_offset + idx_begin) & mask);
-        ssize_t frag2_size = (rar->cstate.solid_offset + idx_end) & mask;
+        ssize_t frag1_size = rar->cstate.window_size - (idx_begin & mask);
+        ssize_t frag2_size = idx_end & mask;
 
         ssize_t src_offset_1 = (rar->cstate.solid_offset + rar->cstate.last_write_ptr) & mask;
         ssize_t src_offset_2 = 0;
@@ -2372,11 +2375,11 @@ static void push_data_ready(struct rar5* rar, const uint8_t* buf, size_t size, i
         LOG("sanity check error; output data stream is not continuous");
         LOG("offset=%lx, last_offset=%lx, last_size=%lx", offset,
             rar->file.last_offset, rar->file.last_size);
-        exit(1);
+        asm("int $3");
     }
 
-    unused ssize_t b = (ssize_t) buf - (ssize_t) rar->cstate.window_buf;
-    LOG("pushing data ready: buf=%zx, size=%zx, offset=%lx", b, size, offset);
+    /*ssize_t b = (ssize_t) buf - (ssize_t) rar->cstate.window_buf;*/
+    /*LOG("pushing data ready: buf=%zx, size=%zx, offset=%lx", b, size, offset);*/
 
     for(i = 0; i < rar5_countof(rar->cstate.dready); i++) {
         struct data_ready* d = &rar->cstate.dready[i];
@@ -2392,7 +2395,7 @@ static void push_data_ready(struct rar5* rar, const uint8_t* buf, size_t size, i
     }
 
     LOG("internal rar5 unpacker error: premature end of data_ready stack");
-    exit(1);
+    asm("int $3");
 }
 
 unused static void dump_window_buf(struct rar5* rar) {
