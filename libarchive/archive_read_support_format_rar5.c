@@ -57,14 +57,14 @@
 // #define CHECK_CRC_ON_SOLID_SKIP
 // #define DONT_FAIL_ON_CRC_ERROR
 
-static int rar5_read_data_skip(struct archive_read *a);
+#define HUFF_NC 306
+#define HUFF_DC 64
+#define HUFF_LDC 16
+#define HUFF_RC 44
+#define HUFF_BC 20
+#define HUFF_TABLE_SIZE (HUFF_NC + HUFF_DC + HUFF_RC + HUFF_LDC)
 
-/*
- * TODO: check a situation where we read 1 chunk of data, and we skip the rest.
- *       - for compressed nonsolid archives
- *       - for compressed solid archives
- *       - for stored archives
- */
+static int rar5_read_data_skip(struct archive_read *a);
 
 struct file_header {
     uint64_t bytes_remaining;
@@ -72,6 +72,8 @@ struct file_header {
     uint64_t prev_read_bytes;
     int64_t last_offset;         /* used in sanity checks */
     int64_t last_size;           /* used in sanity checks */
+
+    int solid : 1;               /* is this a solid stream? */
 
     /* optional time fields */
     uint64_t e_mtime;
@@ -99,25 +101,13 @@ enum FILTER_TYPE {
     FILTER_NONE  = 8,
 };
 
-#define HUFF_NC 306
-#define HUFF_DC 64
-#define HUFF_LDC 16
-#define HUFF_RC 44
-#define HUFF_BC 20
-#define HUFF_TABLE_SIZE (HUFF_NC + HUFF_DC + HUFF_RC + HUFF_LDC)
-
-static const int CIF_SOLID       = 0x00000001;
-/*static const int CIF_TABLES_READ = 0x00000002;*/
-
-#define MAX_QUICK_DECODE_BITS 10
-
 struct decode_table {
     uint32_t size;
     int32_t decode_len[16];
     uint32_t decode_pos[16];
     uint32_t quick_bits;
-    uint8_t quick_len[1 << MAX_QUICK_DECODE_BITS];
-    uint16_t quick_num[1 << MAX_QUICK_DECODE_BITS];
+    uint8_t quick_len[1 << 10];
+    uint16_t quick_num[1 << 10];
     uint16_t decode_num[306];
 };
 
@@ -212,8 +202,9 @@ struct main_header {
 
     /* If this a multi-file archive? */
     uint8_t volume : 1;
-
     uint8_t notused : 6;
+
+    int vol_no;
 };
 
 /* Main context structure. */
@@ -233,13 +224,13 @@ struct rar5 {
      * becuase we're focusing on streaming interface. QuickOpen is designed
      * to make things quicker for non-stream interfaces, so it's not our
      * use case. */
-    int64_t qlist_offset;
+    uint64_t qlist_offset;
 
     /* An offset to additional Recovery data. This is not supported by this
      * unpacker. Recovery data are additional Reed-Solomon codes that could
      * be used to calculate bytes that are missing in archive or are
      * corrupted. */
-    int64_t rr_offset;   
+    uint64_t rr_offset;   
 
     /* Various context variables grouped to different structures. */
     struct main_header main;
@@ -691,14 +682,6 @@ static void reset_file_context(struct rar5* rar) {
     cdeque_clear(&rar->cstate.filters);
 }
 
-unused static int is_solid(struct rar5* rar) {
-    return (rar->cstate.flags & CIF_SOLID) > 0;
-}
-
-unused static void set_solid(struct rar5* rar, int flag) {
-    rar->cstate.flags |= flag ? CIF_SOLID : 0;
-}
-
 const unsigned char rar5_signature[] = { 0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00 };
 const size_t rar5_signature_size = sizeof(rar5_signature);
 const size_t g_unpack_buf_chunk_size = 1024;
@@ -731,6 +714,7 @@ static int read_ahead(struct archive_read* a, size_t how_many, const uint8_t** p
 
     ssize_t avail = -1;
     *ptr = __archive_read_ahead(a, how_many, &avail);
+    LOG("read_ahead how_many=%zu, avail=%zi", how_many, avail);
     if(*ptr == NULL) {
         return 0;
     }
@@ -755,7 +739,7 @@ static int read_ahead(struct archive_read* a, size_t how_many, const uint8_t** p
  *           invalid value.
  */
 
-static int read_var(struct archive_read* a, uint64_t* pvalue, size_t* pvalue_len) {
+static int read_var(struct archive_read* a, uint64_t* pvalue, uint64_t* pvalue_len) {
     uint64_t result = 0;
     size_t shift, i;
     const uint8_t* p;
@@ -958,7 +942,7 @@ static int rar5_options(struct archive_read *a, const char *key, const char *val
     return ARCHIVE_FATAL;
 }
 
-static void init_header(struct archive_read* a, struct rar5* rar) {
+static void init_header(struct archive_read* a) {
     a->archive.archive_format = ARCHIVE_FORMAT_RAR_V5;
     a->archive.archive_format_name = "RAR5";
 }
@@ -1271,7 +1255,7 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
     rar->cstate.method = c_method;
     rar->cstate.version = c_version + 50;
 
-    set_solid(rar, (int) (compression_info & SOLID));
+    rar->file.solid = compression_info & SOLID;
 
     if(!read_var_sized(a, &host_os, NULL))
         return ARCHIVE_EOF;
@@ -1377,18 +1361,25 @@ static int process_head_main(struct archive_read* a, struct rar5* rar, struct ar
     }
 
     enum MAIN_FLAGS {
-        VOLUME = 0x0001, VOLUME_NUMBER = 0x0002, SOLID = 0x0004, PROTECT = 0x0008, LOCK = 0x0010,
+        VOLUME = 0x0001,         /* multi-volume archive */
+        VOLUME_NUMBER = 0x0002,  /* volume number, first vol doesnt have it */
+        SOLID = 0x0004,          /* solid archive */
+        PROTECT = 0x0008,        /* contains Recovery info */
+        LOCK = 0x0010,           /* readonly flag, not used */
     };
 
-    LOG("archive flags: 0x%08zu", archive_flags);
-    if(archive_flags & VOLUME) {
-        rar->main.volume = 1;
-        LOG("*** volume archives not supported yet"); // TODO implement this
-        return ARCHIVE_FATAL;
-    }
+    rar->main.volume = archive_flags & VOLUME;
+    rar->main.solid = archive_flags & SOLID;
 
-    if(archive_flags & SOLID) {
-        rar->main.solid = 1;
+    if(archive_flags & VOLUME_NUMBER) {
+        uint64_t v;
+        if(!read_var_sized(a, &v, NULL)) {
+            LOG("bad volume_number");
+            return ARCHIVE_EOF;
+        }
+
+        rar->main.vol_no = (int) v;
+        LOG("volume number: %d", rar->main.vol_no);
     }
 
     if(extra_data_size == 0) {
@@ -1540,7 +1531,7 @@ static int rar5_read_header(struct archive_read *a, struct archive_entry *entry)
     int ret;
 
     if(rar->header_initialized == 0) {
-        init_header(a, rar);
+        init_header(a);
         rar->header_initialized = 1;
     }
 
@@ -1877,7 +1868,7 @@ static int parse_tables(struct archive_read* a, struct rar5* rar, const uint8_t*
 
 static int parse_block_header(const uint8_t* p, ssize_t* block_size, struct compressed_block_header* hdr) {
     memcpy(hdr, p, sizeof(struct compressed_block_header));
-    /*LOG("parsing block header: ptr is %02x %02x %02x %02x", p[0], p[1], p[2], p[3]);*/
+    LOG("parsing block header: ptr is %02x %02x %02x %02x", p[0], p[1], p[2], p[3]);
     if(hdr->block_flags.byte_count == 3) {
         LOG("error: block header byte_count is %d", hdr->block_flags.byte_count);
         return ARCHIVE_FATAL;
