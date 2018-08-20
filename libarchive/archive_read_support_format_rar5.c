@@ -207,6 +207,13 @@ struct main_header {
     int vol_no;
 };
 
+struct generic_header {
+    int split_after : 1;
+    int split_before : 1;
+    int padding : 6;
+    int size;
+};
+
 /* Main context structure. */
 struct rar5 {
     int header_initialized;
@@ -233,6 +240,7 @@ struct rar5 {
     uint64_t rr_offset;   
 
     /* Various context variables grouped to different structures. */
+    struct generic_header generic;
     struct main_header main;
     struct comp_state cstate;
     struct file_header file;
@@ -700,26 +708,31 @@ static inline struct rar5* get_context(struct archive_read* a) {
     return (struct rar5*) a->format->data;
 }
 
-static int consume(struct archive_read* a, int64_t how_many) {
-    /*LOG("consume: %ld bytes", how_many);*/
-    return 
-        how_many == __archive_read_consume(a, how_many)
-        ? ARCHIVE_OK
-        : ARCHIVE_FATAL;
-}
-
 static int read_ahead(struct archive_read* a, size_t how_many, const uint8_t** ptr) {
     if(!ptr)
         return 0;
 
     ssize_t avail = -1;
+    LOG("read_ahead request how_many=0x%zx", how_many);
     *ptr = __archive_read_ahead(a, how_many, &avail);
-    LOG("read_ahead how_many=%zu, avail=%zi", how_many, avail);
+    LOG("read_ahead avail=0x%zx", avail);
     if(*ptr == NULL) {
         return 0;
     }
 
     return 1;
+}
+
+static int consume(struct archive_read* a, int64_t how_many) {
+    LOG("consume: 0x%lx bytes", how_many);
+    int ret;
+
+    ret = 
+        how_many == __archive_read_consume(a, how_many)
+        ? ARCHIVE_OK
+        : ARCHIVE_FATAL;
+
+    return ret;
 }
 
 /**
@@ -1477,6 +1490,10 @@ static int process_base_block(struct archive_read* a, struct rar5* rar, struct a
 
     if(!read_var_sized(a, &header_flags, NULL))
         return ARCHIVE_EOF;
+
+    rar->generic.split_after = (header_flags & HFL_SPLIT_AFTER) > 0;
+    rar->generic.split_before = (header_flags & HFL_SPLIT_BEFORE) > 0;
+    rar->generic.size = hdr_size;
 
     enum HEADER_TYPE {
         HEAD_MARK = 0x00, HEAD_MAIN = 0x01, HEAD_FILE = 0x02, HEAD_SERVICE = 0x03,
@@ -2309,6 +2326,8 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
             LOG("consuming %zi bytes resulted in an error: %d", to_skip, ret);
             return ERROR_EOF;
         }
+
+        LOG("block_size: %zx, header_size: %d", block_size, rar->generic.size);
 
         // Read the whole block size into memory. This can take up to
         // 8 megabytes of memory in theoretical cases. Might be worth to
