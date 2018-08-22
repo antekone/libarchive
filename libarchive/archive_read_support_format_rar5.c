@@ -155,6 +155,7 @@ struct comp_state {
     ssize_t cur_block_size;
     int last_len;
     int block_parsing_finished;
+    int switch_multivolume;
     int all_filters_applied;
 
     /* Decode tables used during lzss uncompression. */
@@ -1453,7 +1454,7 @@ static int process_base_block(struct archive_read* a, struct rar5* rar, struct a
         return ARCHIVE_EOF;
     }
 
-    /*LOG("hdr_crc=%08x", hdr_crc);*/
+    LOG("hdr_crc=%08x", hdr_crc);
 
     if(!read_var_sized(a, &raw_hdr_size, &hdr_size_len)) {
         LOG("can't read hdr_size");
@@ -1562,7 +1563,7 @@ static int rar5_read_header(struct archive_read *a, struct archive_entry *entry)
     }
 
     do {
-        /*LOG("-> parsing base header block");*/
+        LOG("-> parsing base header block");
         ret = process_base_block(a, rar, entry);
     } while(ret == ARCHIVE_RETRY);
 
@@ -1885,6 +1886,7 @@ static int parse_tables(struct archive_read* a, struct rar5* rar, const uint8_t*
 
 static int parse_block_header(const uint8_t* p, ssize_t* block_size, struct compressed_block_header* hdr) {
     memcpy(hdr, p, sizeof(struct compressed_block_header));
+
     LOG("parsing block header: ptr is %02x %02x %02x %02x", p[0], p[1], p[2], p[3]);
     if(hdr->block_flags.byte_count == 3) {
         LOG("error: block header byte_count is %d", hdr->block_flags.byte_count);
@@ -2294,13 +2296,15 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
     const uint8_t* p;
     int ret;
 
+    LOG("--- process block");
+
     if(rar->cstate.block_parsing_finished) {
         if(!read_ahead(a, 6, &p)) {
             LOG("failed to prefetch data block header");
             return ERROR_EOF;
         }
 
-        /*LOG("%02x %02x %02x %02x", p[0], p[1], p[2], p[3]);*/
+        LOG("%02x %02x %02x %02x", p[0], p[1], p[2], p[3]);
 
         // Read block_size by parsing block header. Validate the header by
         // calculating CRC byte stored inside the header. Size of the header
@@ -2327,18 +2331,31 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
             return ERROR_EOF;
         }
 
-        LOG("block_size: %zx, header_size: %d", block_size, rar->generic.size);
+        LOG("block_size: %zx, header_size: %d, bytes_remaining: %x", block_size, rar->generic.size, rar->file.bytes_remaining);
+                                                     
+        /* The block size gives information about the whole block size, but
+         * the block could be stored in split form when using multi-volume
+         * archives. In this case, the block size will be bigger than the
+         * actual data stored in this file. Remaining part of the data will
+         * be in another file. */
 
+        if(block_size > rar->file.bytes_remaining) {
+            LOG("*** multi-archive case");
+            rar->cstate.block_parsing_finished = 1;
+            rar->cstate.switch_multivolume = 1;
+        }
+
+        ssize_t cur_block_size = rar5_min(rar->file.bytes_remaining, block_size);
         // Read the whole block size into memory. This can take up to
         // 8 megabytes of memory in theoretical cases. Might be worth to
         // optimize this and use a standard chunk of 4kb's.
-        if(!read_ahead(a, 4 + block_size, &p)) {
-            LOG("failed to prefetch the whole block: %zi bytes", 4 + block_size);
+        if(!read_ahead(a, 4 + cur_block_size, &p)) {
+            LOG("failed to prefetch the whole/partial block: %zi bytes", cur_block_size);
             return ERROR_EOF;
         }
 
         rar->cstate.block_buf = p;
-        rar->cstate.cur_block_size = block_size;
+        rar->cstate.cur_block_size = cur_block_size;
 
         rar->bits.in_addr = 0;
         rar->bits.bit_addr = 0;
@@ -2529,6 +2546,11 @@ static int uncompress_file(struct archive_read* a,
         ret = do_uncompress_file(a, rar);
         if(ret != ARCHIVE_RETRY)
             return ret;
+
+        if(rar->cstate.switch_multivolume) {
+            LOG("switching multivolume");
+            return ARCHIVE_OK;
+        }
     }
 }
 
