@@ -203,7 +203,8 @@ struct main_header {
 
     /* If this a multi-file archive? */
     uint8_t volume : 1;
-    uint8_t notused : 6;
+    uint8_t endarc : 1;
+    uint8_t notused : 5;
 
     int vol_no;
 };
@@ -1495,6 +1496,7 @@ static int process_base_block(struct archive_read* a, struct rar5* rar, struct a
     rar->generic.split_after = (header_flags & HFL_SPLIT_AFTER) > 0;
     rar->generic.split_before = (header_flags & HFL_SPLIT_BEFORE) > 0;
     rar->generic.size = hdr_size;
+    rar->main.endarc = 0;
 
     enum HEADER_TYPE {
         HEAD_MARK = 0x00, HEAD_MAIN = 0x01, HEAD_FILE = 0x02, HEAD_SERVICE = 0x03,
@@ -1523,6 +1525,7 @@ static int process_base_block(struct archive_read* a, struct rar5* rar, struct a
         case HEAD_CRYPT:
             return ARCHIVE_FATAL;
         case HEAD_ENDARC:
+            rar->main.endarc = 1;
             return ARCHIVE_EOF;
         case HEAD_MARK:
             // TODO check if returning EOF on HEAD_MARK is really a proper
@@ -1542,6 +1545,18 @@ static int process_base_block(struct archive_read* a, struct rar5* rar, struct a
     // Not reached.
     archive_set_error(&a->archive, ARCHIVE_ERRNO_PROGRAMMER, "Internal unpacked error");
     return ARCHIVE_FATAL;
+}
+
+static int skip_base_block(struct archive_read* a, struct rar5* rar) {
+    int ret;
+
+    struct archive_entry entry;
+    ret = process_base_block(a, rar, &entry);
+
+    if(ret == ARCHIVE_OK) 
+        return ARCHIVE_RETRY;
+    else
+        return ret;
 }
 
 static int rar5_read_header(struct archive_read *a, struct archive_entry *entry) {
@@ -2537,9 +2552,29 @@ static int do_uncompress_file(struct archive_read* a,
     return ARCHIVE_OK;
 }
 
-static int uncompress_file(struct archive_read* a,
-                           struct rar5* rar)
-{
+static int scan_for_signature(struct archive_read* a, struct rar5* rar) {
+    const uint8_t* p;
+    int ret;
+    const int chunk_size = 512;
+
+    while(1) {
+        if(!read_ahead(a, chunk_size, &p))
+            return ARCHIVE_EOF;
+
+        for(int i = 0; i < chunk_size - rar5_signature_size; i++) {
+            if(memcmp(&p[i], rar5_signature, rar5_signature_size) == 0) {
+                consume(a, i + rar5_signature_size);
+                return ARCHIVE_OK;
+            }
+        }
+
+        consume(a, chunk_size);
+    }
+
+    return ARCHIVE_FATAL;
+}
+
+static int uncompress_file(struct archive_read* a, struct rar5* rar) {
     int ret;
 
     while(1) {
@@ -2548,8 +2583,30 @@ static int uncompress_file(struct archive_read* a,
             return ret;
 
         if(rar->cstate.switch_multivolume) {
-            LOG("switching multivolume");
-            return ARCHIVE_OK;
+            int lret;
+            const uint8_t* buf;
+
+            while(1) {
+                if(rar->main.endarc == 1) {
+                    rar->main.endarc = 0;
+                    lret = scan_for_signature(a, rar);
+                    if(lret == ARCHIVE_OK) {
+                        while(ARCHIVE_RETRY == skip_base_block(a, rar));
+                        /* TODO: verify this was a FILE block */
+                        break;
+                    } else {
+                        return lret;
+                    }
+                } else {
+                    lret = skip_base_block(a, rar);
+                    if(lret != ARCHIVE_RETRY) {
+                        if(rar->main.endarc == 0)
+                            return lret;
+                        else
+                            continue;
+                    }
+                }
+            }
         }
     }
 }
