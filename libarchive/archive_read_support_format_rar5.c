@@ -210,10 +210,15 @@ struct main_header {
 };
 
 struct generic_header {
-    int split_after : 1;
-    int split_before : 1;
-    int padding : 6;
+    uint8_t split_after : 1;
+    uint8_t split_before : 1;
+    uint8_t padding : 6;
     int size;
+    int last_header_id;
+};
+
+struct multivolume {
+    int expected_vol_no;
 };
 
 /* Main context structure. */
@@ -247,6 +252,7 @@ struct rar5 {
     struct comp_state cstate;
     struct file_header file;
     struct bit_reader bits;
+    struct multivolume vol;
 
     /* The header of currently processed RARv5 block. Used in main
      * decompression logic loop. */
@@ -1197,7 +1203,10 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
     UNUSED(c_method);
     UNUSED(c_version);
 
-    reset_file_context(rar);
+    /* Do not reset file context if we're switching archives. */
+    if(!rar->cstate.switch_multivolume) {
+        reset_file_context(rar);
+    }
 
     if(block_flags & HFL_EXTRA_DATA) {
         size_t edata_size;
@@ -1212,6 +1221,7 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
         if(!read_var_sized(a, &data_size, NULL))
             return ARCHIVE_EOF;
 
+        LOG("setting bytes_remaining to: %zx", data_size);
         rar->file.bytes_remaining = data_size;
     } else {
         rar->file.bytes_remaining = 0;
@@ -1329,9 +1339,13 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
     }
 
     archive_entry_update_pathname_utf8(entry, name_utf8_buf);
-    rar->cstate.block_parsing_finished = 1;
-    rar->cstate.all_filters_applied = 1;
-    rar->cstate.initialized = 0;
+
+    if(!rar->cstate.switch_multivolume) {
+        /* Do not reinitialize unpacking state if we're switching archives. */
+        rar->cstate.block_parsing_finished = 1;
+        rar->cstate.all_filters_applied = 1;
+        rar->cstate.initialized = 0;
+    }
 
     return ARCHIVE_OK;
 }
@@ -1395,6 +1409,15 @@ static int process_head_main(struct archive_read* a, struct rar5* rar, struct ar
 
         rar->main.vol_no = (int) v;
         LOG("volume number: %d", rar->main.vol_no);
+    } else {
+        rar->main.vol_no = 0;
+    }
+
+    if(rar->vol.expected_vol_no > 0 && rar->main.vol_no != rar->vol.expected_vol_no) {
+        LOG("fatal: expected volume number (%d) doesn't match physical volume number (%d)",
+            rar->vol.expected_vol_no, rar->main.vol_no);
+
+        return ARCHIVE_FATAL;
     }
 
     if(extra_data_size == 0) {
@@ -1496,6 +1519,7 @@ static int process_base_block(struct archive_read* a, struct rar5* rar, struct a
     rar->generic.split_after = (header_flags & HFL_SPLIT_AFTER) > 0;
     rar->generic.split_before = (header_flags & HFL_SPLIT_BEFORE) > 0;
     rar->generic.size = hdr_size;
+    rar->generic.last_header_id = header_id;
     rar->main.endarc = 0;
 
     enum HEADER_TYPE {
@@ -1552,6 +1576,10 @@ static int skip_base_block(struct archive_read* a, struct rar5* rar) {
 
     struct archive_entry entry;
     ret = process_base_block(a, rar, &entry);
+
+    /* TODO: change this '2' to 'HEAD_FILE' */
+    if(rar->generic.last_header_id == 2 && rar->generic.split_before > 0)
+        return ARCHIVE_OK;
 
     if(ret == ARCHIVE_OK) 
         return ARCHIVE_RETRY;
@@ -1903,7 +1931,7 @@ static int parse_block_header(const uint8_t* p, ssize_t* block_size, struct comp
     memcpy(hdr, p, sizeof(struct compressed_block_header));
 
     LOG("parsing block header: ptr is %02x %02x %02x %02x", p[0], p[1], p[2], p[3]);
-    if(hdr->block_flags.byte_count == 3) {
+    if(hdr->block_flags.byte_count > 2) {
         LOG("error: block header byte_count is %d", hdr->block_flags.byte_count);
         return ARCHIVE_FATAL;
     }
@@ -2105,8 +2133,6 @@ static int do_uncompress_block(struct archive_read* a,
     int ret;
     const uint8_t bit_size = 1 + hdr->block_flags.bit_size;
     int noisy = 0;
-
-    rar->cstate.block_parsing_finished = 0;
 
     while(1) {
         if(rar->cstate.write_ptr - rar->cstate.last_write_ptr > (4 * 1024 * 1024)) {
@@ -2314,6 +2340,8 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
     LOG("--- process block");
 
     if(rar->cstate.block_parsing_finished) {
+        rar->cstate.block_parsing_finished = 0;
+
         if(!read_ahead(a, 6, &p)) {
             LOG("failed to prefetch data block header");
             return ERROR_EOF;
@@ -2356,11 +2384,16 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
 
         if(block_size > rar->file.bytes_remaining) {
             LOG("*** multi-archive case");
-            rar->cstate.block_parsing_finished = 1;
             rar->cstate.switch_multivolume = 1;
+            rar->vol.expected_vol_no = rar->main.vol_no + 1;
+
+            LOG("next block should have %zx bytes", block_size - rar->file.bytes_remaining);
+        } else {
+            rar->cstate.switch_multivolume = 0;
         }
 
         ssize_t cur_block_size = rar5_min(rar->file.bytes_remaining, block_size);
+
         // Read the whole block size into memory. This can take up to
         // 8 megabytes of memory in theoretical cases. Might be worth to
         // optimize this and use a standard chunk of 4kb's.
@@ -2392,7 +2425,7 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
         return ERROR_FATAL;
     }
 
-    if(rar->cstate.block_parsing_finished) {
+    if(rar->cstate.block_parsing_finished || rar->cstate.switch_multivolume) {
         if(rar->cstate.cur_block_size > 0) {
             rar->file.bytes_remaining -= rar->cstate.cur_block_size;
             if(ARCHIVE_OK != consume(a, rar->cstate.cur_block_size)) {
