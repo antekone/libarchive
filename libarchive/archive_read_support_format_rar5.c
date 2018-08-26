@@ -219,6 +219,7 @@ struct generic_header {
 
 struct multivolume {
     int expected_vol_no;
+    const char* push_buf;
 };
 
 /* Main context structure. */
@@ -2329,6 +2330,57 @@ static int do_uncompress_block(struct archive_read* a,
     return ARCHIVE_OK;
 }
 
+static int scan_for_signature(struct archive_read* a, struct rar5* rar) {
+    const uint8_t* p;
+    int ret;
+    const int chunk_size = 512;
+
+    while(1) {
+        if(!read_ahead(a, chunk_size, &p))
+            return ARCHIVE_EOF;
+
+        for(int i = 0; i < chunk_size - rar5_signature_size; i++) {
+            if(memcmp(&p[i], rar5_signature, rar5_signature_size) == 0) {
+                consume(a, i + rar5_signature_size);
+                return ARCHIVE_OK;
+            }
+        }
+
+        consume(a, chunk_size);
+    }
+
+    return ARCHIVE_FATAL;
+}
+
+static int advance_multivolume(struct archive_read* a, struct rar5* rar) {
+    int lret;
+    const uint8_t* buf;
+
+    while(1) {
+        if(rar->main.endarc == 1) {
+            rar->main.endarc = 0;
+            lret = scan_for_signature(a, rar);
+            if(lret == ARCHIVE_OK) {
+                while(ARCHIVE_RETRY == skip_base_block(a, rar));
+                /* TODO: verify this was a FILE block */
+                break;
+            } else {
+                return lret;
+            }
+        } else {
+            lret = skip_base_block(a, rar);
+            if(lret != ARCHIVE_RETRY) {
+                if(rar->main.endarc == 0)
+                    return lret;
+                else
+                    continue;
+            }
+        }
+    }
+
+    return ARCHIVE_OK;
+}
+
 enum PROCESS_BLOCK_RET {
     CONTINUE, LAST_BLOCK, ERROR_FATAL, ERROR_EOF
 };
@@ -2382,24 +2434,54 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
          * actual data stored in this file. Remaining part of the data will
          * be in another file. */
 
+        ssize_t cur_block_size = rar5_min(rar->file.bytes_remaining, block_size);
+
         if(block_size > rar->file.bytes_remaining) {
             LOG("*** multi-archive case");
             rar->cstate.switch_multivolume = 1;
             rar->vol.expected_vol_no = rar->main.vol_no + 1;
 
-            LOG("next block should have %zx bytes", block_size - rar->file.bytes_remaining);
+            if(rar->vol.push_buf)
+                free(rar->vol.push_buf);
+
+            rar->vol.push_buf = malloc(block_size);
+            if(!rar->vol.push_buf) {
+                // No memory
+                return ARCHIVE_FATAL;
+            }
+
+            memset(rar->vol.push_buf, 0xA1, block_size);
+
+            if(!read_ahead(a, cur_block_size, &p))
+                return ERROR_EOF;
+
+            memcpy(rar->vol.push_buf, p, cur_block_size);
+
+            if(ARCHIVE_OK != consume(a, cur_block_size))
+                return ERROR_EOF;
+
+            advance_multivolume(a, rar);
+
+            if(!read_ahead(a, block_size - cur_block_size, &p))
+                return ERROR_EOF;
+
+            memcpy(rar->vol.push_buf + cur_block_size, p, block_size - cur_block_size);
+
+            if(ARCHIVE_OK != consume(a, block_size - cur_block_size))
+                return ERROR_EOF;
+            
+            p = rar->vol.push_buf;
+            cur_block_size = block_size;
         } else {
             rar->cstate.switch_multivolume = 0;
-        }
 
-        ssize_t cur_block_size = rar5_min(rar->file.bytes_remaining, block_size);
-
-        // Read the whole block size into memory. This can take up to
-        // 8 megabytes of memory in theoretical cases. Might be worth to
-        // optimize this and use a standard chunk of 4kb's.
-        if(!read_ahead(a, 4 + cur_block_size, &p)) {
-            LOG("failed to prefetch the whole/partial block: %zi bytes", cur_block_size);
-            return ERROR_EOF;
+            // Read the whole block size into memory. This can take up to
+            // 8 megabytes of memory in theoretical cases. Might be worth to
+            // optimize this and use a standard chunk of 4kb's.
+            if(!read_ahead(a, 4 + cur_block_size, &p)) {
+                LOG("failed to prefetch the whole/partial block: %zi bytes", cur_block_size);
+                return ERROR_EOF;
+            }
         }
 
         rar->cstate.block_buf = p;
@@ -2425,7 +2507,7 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
         return ERROR_FATAL;
     }
 
-    if(rar->cstate.block_parsing_finished || rar->cstate.switch_multivolume) {
+    if(rar->cstate.block_parsing_finished && !rar->cstate.switch_multivolume) {
         if(rar->cstate.cur_block_size > 0) {
             rar->file.bytes_remaining -= rar->cstate.cur_block_size;
             if(ARCHIVE_OK != consume(a, rar->cstate.cur_block_size)) {
@@ -2434,6 +2516,9 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
             }
         }
     }
+
+    if(rar->cstate.switch_multivolume)
+        rar->cstate.switch_multivolume = 0;
 
     if(rar->cstate.block_parsing_finished && rar->last_block_hdr.block_flags.is_last_block) {
         return LAST_BLOCK;
@@ -2585,28 +2670,6 @@ static int do_uncompress_file(struct archive_read* a,
     return ARCHIVE_OK;
 }
 
-static int scan_for_signature(struct archive_read* a, struct rar5* rar) {
-    const uint8_t* p;
-    int ret;
-    const int chunk_size = 512;
-
-    while(1) {
-        if(!read_ahead(a, chunk_size, &p))
-            return ARCHIVE_EOF;
-
-        for(int i = 0; i < chunk_size - rar5_signature_size; i++) {
-            if(memcmp(&p[i], rar5_signature, rar5_signature_size) == 0) {
-                consume(a, i + rar5_signature_size);
-                return ARCHIVE_OK;
-            }
-        }
-
-        consume(a, chunk_size);
-    }
-
-    return ARCHIVE_FATAL;
-}
-
 static int uncompress_file(struct archive_read* a, struct rar5* rar) {
     int ret;
 
@@ -2614,33 +2677,6 @@ static int uncompress_file(struct archive_read* a, struct rar5* rar) {
         ret = do_uncompress_file(a, rar);
         if(ret != ARCHIVE_RETRY)
             return ret;
-
-        if(rar->cstate.switch_multivolume) {
-            int lret;
-            const uint8_t* buf;
-
-            while(1) {
-                if(rar->main.endarc == 1) {
-                    rar->main.endarc = 0;
-                    lret = scan_for_signature(a, rar);
-                    if(lret == ARCHIVE_OK) {
-                        while(ARCHIVE_RETRY == skip_base_block(a, rar));
-                        /* TODO: verify this was a FILE block */
-                        break;
-                    } else {
-                        return lret;
-                    }
-                } else {
-                    lret = skip_base_block(a, rar);
-                    if(lret != ARCHIVE_RETRY) {
-                        if(rar->main.endarc == 0)
-                            return lret;
-                        else
-                            continue;
-                    }
-                }
-            }
-        }
     }
 }
 
