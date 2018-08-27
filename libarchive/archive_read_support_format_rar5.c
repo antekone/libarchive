@@ -56,6 +56,7 @@
 
 // #define CHECK_CRC_ON_SOLID_SKIP
 // #define DONT_FAIL_ON_CRC_ERROR
+#define DEBUG
 
 #define HUFF_NC 306
 #define HUFF_DC 64
@@ -722,9 +723,9 @@ static int read_ahead(struct archive_read* a, size_t how_many, const uint8_t** p
         return 0;
 
     ssize_t avail = -1;
-    LOG("read_ahead request how_many=0x%zx", how_many);
+    /*LOG("read_ahead request how_many=0x%zx", how_many);*/
     *ptr = __archive_read_ahead(a, how_many, &avail);
-    LOG("read_ahead avail=0x%zx", avail);
+    /*LOG("read_ahead avail=0x%zx", avail);*/
     if(*ptr == NULL) {
         return 0;
     }
@@ -736,10 +737,26 @@ static int consume(struct archive_read* a, int64_t how_many) {
     LOG("consume: 0x%lx bytes", how_many);
     int ret;
 
+#ifdef DEBUG
+    const uint8_t* p;
+    read_ahead(a, 4, &p);
+
+    printf("pre consume: ");
+    for(int i = 0; i < 4; i++) { printf("%02x ", p[i]); }
+    printf("\n");
+#endif
+
     ret = 
         how_many == __archive_read_consume(a, how_many)
         ? ARCHIVE_OK
         : ARCHIVE_FATAL;
+
+#ifdef DEBUG
+    read_ahead(a, 4, &p);
+    printf("post consume: ");
+    for(int i = 0; i < 4; i++) { printf("%02x ", p[i]); }
+    printf("\n");
+#endif
 
     return ret;
 }
@@ -2437,9 +2454,19 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
         ssize_t cur_block_size = rar5_min(rar->file.bytes_remaining, block_size);
 
         if(block_size > rar->file.bytes_remaining) {
-            LOG("*** multi-archive case");
+            LOG("*** multi-archive case, block part: %zx bytes, full block: %zx bytes",
+                    cur_block_size, block_size);
+
+            LOG("*** bytes_remaining=%zx", rar->file.bytes_remaining);
+            if(cur_block_size != rar->file.bytes_remaining) {
+                LOG("*** placeholder, need to implement a loop here!");
+                exit(1);
+            }
+
             rar->cstate.switch_multivolume = 1;
             rar->vol.expected_vol_no = rar->main.vol_no + 1;
+
+            LOG("*** part%03d -> part%03d", 1 + rar->main.vol_no, 1 + rar->vol.expected_vol_no);
 
             if(rar->vol.push_buf)
                 free(rar->vol.push_buf);
@@ -2450,8 +2477,6 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
                 return ARCHIVE_FATAL;
             }
 
-            memset(rar->vol.push_buf, 0xA1, block_size);
-
             if(!read_ahead(a, cur_block_size, &p))
                 return ERROR_EOF;
 
@@ -2460,7 +2485,9 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
             if(ARCHIVE_OK != consume(a, cur_block_size))
                 return ERROR_EOF;
 
+            LOG("advancing multivolume");
             advance_multivolume(a, rar);
+            LOG("advance done, bytes_remaining=%zx", rar->file.bytes_remaining);
 
             if(!read_ahead(a, block_size - cur_block_size, &p))
                 return ERROR_EOF;
@@ -2471,6 +2498,9 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
                 return ERROR_EOF;
             
             p = rar->vol.push_buf;
+            LOG("bytes_remaining -= 0x%zx", block_size - cur_block_size);
+            rar->file.bytes_remaining -= block_size - cur_block_size;
+            LOG("new bytes_remaining=0x%zx", rar->file.bytes_remaining);
             cur_block_size = block_size;
         } else {
             rar->cstate.switch_multivolume = 0;
@@ -2509,16 +2539,19 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
 
     if(rar->cstate.block_parsing_finished && !rar->cstate.switch_multivolume) {
         if(rar->cstate.cur_block_size > 0) {
+            LOG("bytes_remaining -= 0x%zx", rar->cstate.cur_block_size);
             rar->file.bytes_remaining -= rar->cstate.cur_block_size;
+            LOG("new bytes_remaining=0x%zx", rar->file.bytes_remaining);
             if(ARCHIVE_OK != consume(a, rar->cstate.cur_block_size)) {
                 LOG("fail when consuming");
                 return ARCHIVE_FATAL;
             }
         }
-    }
-
-    if(rar->cstate.switch_multivolume)
+    } else if(rar->cstate.switch_multivolume) {
         rar->cstate.switch_multivolume = 0;
+        //rar->file.bytes_remaining -= rar->cstate.cur_block_size;
+        LOG("new bytes_remaining=0x%zx", rar->file.bytes_remaining);
+    }
 
     if(rar->cstate.block_parsing_finished && rar->last_block_hdr.block_flags.is_last_block) {
         return LAST_BLOCK;
