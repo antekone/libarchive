@@ -68,7 +68,7 @@
 static int rar5_read_data_skip(struct archive_read *a);
 
 struct file_header {
-    uint64_t bytes_remaining;
+    ssize_t bytes_remaining;
     uint64_t read_offset;        /* used during extraction of stored files */
     uint64_t prev_read_bytes;
     int64_t last_offset;         /* used in sanity checks */
@@ -220,7 +220,7 @@ struct generic_header {
 
 struct multivolume {
     int expected_vol_no;
-    const char* push_buf;
+    uint8_t* push_buf;
 };
 
 /* Main context structure. */
@@ -701,7 +701,7 @@ static void reset_file_context(struct rar5* rar) {
 }
 
 const unsigned char rar5_signature[] = { 0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00 };
-const size_t rar5_signature_size = sizeof(rar5_signature);
+const ssize_t rar5_signature_size = sizeof(rar5_signature);
 const size_t g_unpack_buf_chunk_size = 1024;
 const size_t g_unpack_window_size = 0x20000;
 
@@ -1585,7 +1585,7 @@ static int process_base_block(struct archive_read* a, struct rar5* rar, struct a
     }
 
     // Not reached.
-    archive_set_error(&a->archive, ARCHIVE_ERRNO_PROGRAMMER, "Internal unpacked error");
+    archive_set_error(&a->archive, ARCHIVE_ERRNO_PROGRAMMER, "Internal unpacker error");
     return ARCHIVE_FATAL;
 }
 
@@ -2347,16 +2347,15 @@ static int do_uncompress_block(struct archive_read* a,
     return ARCHIVE_OK;
 }
 
-static int scan_for_signature(struct archive_read* a, struct rar5* rar) {
+static int scan_for_signature(struct archive_read* a) {
     const uint8_t* p;
-    int ret;
     const int chunk_size = 512;
 
     while(1) {
         if(!read_ahead(a, chunk_size, &p))
             return ARCHIVE_EOF;
 
-        for(int i = 0; i < chunk_size - rar5_signature_size; i++) {
+        for(ssize_t i = 0; i < chunk_size - rar5_signature_size; i++) {
             if(memcmp(&p[i], rar5_signature, rar5_signature_size) == 0) {
                 consume(a, i + rar5_signature_size);
                 return ARCHIVE_OK;
@@ -2371,12 +2370,20 @@ static int scan_for_signature(struct archive_read* a, struct rar5* rar) {
 
 static int advance_multivolume(struct archive_read* a, struct rar5* rar) {
     int lret;
-    const uint8_t* buf;
+
+    /* A small state machine that will skip unnecessary data, needed to
+     * switch from one multivolume to another. Such skipping is needed if
+     * we want to be an stream-oriented (instead of file-oriented) 
+     * unpacker.
+     *
+     * The state machine starts with `rar->main.endarc` == 0. It also
+     * assumes that current stream pointer points to some base block header. 
+     */
 
     while(1) {
         if(rar->main.endarc == 1) {
             rar->main.endarc = 0;
-            lret = scan_for_signature(a, rar);
+            lret = scan_for_signature(a);
             if(lret == ARCHIVE_OK) {
                 while(ARCHIVE_RETRY == skip_base_block(a, rar));
                 /* TODO: verify this was a FILE block */
@@ -2385,15 +2392,87 @@ static int advance_multivolume(struct archive_read* a, struct rar5* rar) {
                 return lret;
             }
         } else {
+            /* Skip current base block. In order to properly skip it,
+             * we weally need to simply parse it and discard the results. */
+
             lret = skip_base_block(a, rar);
+
+            /* The `skip_base_block` function tells us if we should continue
+             * with skipping, or we should stop skipping. We're trying to skip
+             * everything up to a base FILE block. */
+
             if(lret != ARCHIVE_RETRY) {
-                if(rar->main.endarc == 0)
+                /* If there was an error during skipping, or we have just
+                 * skipped a FILE base block... */
+
+                if(rar->main.endarc == 0) {
                     return lret;
-                else
+                } else {
                     continue;
+                }
             }
         }
     }
+
+    return ARCHIVE_OK;
+}
+
+static int merge_block(struct archive_read* a, struct rar5* rar, ssize_t block_size, ssize_t* pcur_block_size, const uint8_t** p) {
+    int ret;
+    ssize_t cur_block_size = *pcur_block_size;
+    const uint8_t* lp;
+
+    LOG("*** multi-archive case, block part: %zx bytes, full block: %zx bytes",
+            cur_block_size, block_size);
+
+    LOG("*** bytes_remaining=%zx", rar->file.bytes_remaining);
+    if(cur_block_size != rar->file.bytes_remaining) {
+        LOG("*** placeholder, need to implement a loop here!");
+        exit(1);
+    }
+
+    rar->cstate.switch_multivolume = 1;
+    rar->vol.expected_vol_no = rar->main.vol_no + 1;
+
+    LOG("*** part%03d -> part%03d", 1 + rar->main.vol_no, 1 + rar->vol.expected_vol_no);
+
+    if(rar->vol.push_buf)
+        free((void*) rar->vol.push_buf);
+
+    rar->vol.push_buf = malloc(block_size);
+    if(!rar->vol.push_buf) {
+        // No memory
+        return ARCHIVE_FATAL;
+    }
+
+    if(!read_ahead(a, cur_block_size, &lp))
+        return ARCHIVE_EOF;
+
+    memcpy(rar->vol.push_buf, lp, cur_block_size);
+
+    if(ARCHIVE_OK != consume(a, cur_block_size))
+        return ARCHIVE_EOF;
+
+    ret = advance_multivolume(a, rar);
+    if(ret != ARCHIVE_OK) {
+        LOG("error: advance multivolume didn't return ARCHIVE_OK");
+        return ret;
+    }
+
+    if(!read_ahead(a, block_size - cur_block_size, &lp))
+        return ARCHIVE_EOF;
+
+    memcpy(rar->vol.push_buf + cur_block_size, lp, block_size - cur_block_size);
+
+    if(ARCHIVE_OK != consume(a, block_size - cur_block_size))
+        return ARCHIVE_EOF;
+
+
+    rar->file.bytes_remaining -= block_size - cur_block_size;
+    cur_block_size = block_size;
+
+    *pcur_block_size = cur_block_size;
+    *p = rar->vol.push_buf;
 
     return ARCHIVE_OK;
 }
@@ -2443,8 +2522,6 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
             return ERROR_EOF;
         }
 
-        LOG("block_size: %zx, header_size: %d, bytes_remaining: %x", block_size, rar->generic.size, rar->file.bytes_remaining);
-                                                     
         /* The block size gives information about the whole block size, but
          * the block could be stored in split form when using multi-volume
          * archives. In this case, the block size will be bigger than the
@@ -2454,54 +2531,21 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
         ssize_t cur_block_size = rar5_min(rar->file.bytes_remaining, block_size);
 
         if(block_size > rar->file.bytes_remaining) {
-            LOG("*** multi-archive case, block part: %zx bytes, full block: %zx bytes",
-                    cur_block_size, block_size);
+            /* If current blocks' size is bigger than our data size, this
+             * means we have a multivolume archive. In this case, skip
+             * all base headers until the end of the file, proceed to next
+             * "partXXX.rar" volume, find its signature, skip all headers up
+             * to the first FILE base header, and continue from there.
+             *
+             * Note that `merge_block` will update the `rar` context structure
+             * quite extensively. */
 
-            LOG("*** bytes_remaining=%zx", rar->file.bytes_remaining);
-            if(cur_block_size != rar->file.bytes_remaining) {
-                LOG("*** placeholder, need to implement a loop here!");
-                exit(1);
-            }
+            merge_block(a, rar, block_size, &cur_block_size, &p);
 
-            rar->cstate.switch_multivolume = 1;
-            rar->vol.expected_vol_no = rar->main.vol_no + 1;
-
-            LOG("*** part%03d -> part%03d", 1 + rar->main.vol_no, 1 + rar->vol.expected_vol_no);
-
-            if(rar->vol.push_buf)
-                free(rar->vol.push_buf);
-
-            rar->vol.push_buf = malloc(block_size);
-            if(!rar->vol.push_buf) {
-                // No memory
-                return ARCHIVE_FATAL;
-            }
-
-            if(!read_ahead(a, cur_block_size, &p))
-                return ERROR_EOF;
-
-            memcpy(rar->vol.push_buf, p, cur_block_size);
-
-            if(ARCHIVE_OK != consume(a, cur_block_size))
-                return ERROR_EOF;
-
-            LOG("advancing multivolume");
-            advance_multivolume(a, rar);
-            LOG("advance done, bytes_remaining=%zx", rar->file.bytes_remaining);
-
-            if(!read_ahead(a, block_size - cur_block_size, &p))
-                return ERROR_EOF;
-
-            memcpy(rar->vol.push_buf + cur_block_size, p, block_size - cur_block_size);
-
-            if(ARCHIVE_OK != consume(a, block_size - cur_block_size))
-                return ERROR_EOF;
-            
-            p = rar->vol.push_buf;
-            LOG("bytes_remaining -= 0x%zx", block_size - cur_block_size);
-            rar->file.bytes_remaining -= block_size - cur_block_size;
-            LOG("new bytes_remaining=0x%zx", rar->file.bytes_remaining);
-            cur_block_size = block_size;
+            /* Current stream pointer should be now directly *after* the
+             * block that spanned through multiple archive files. `p` pointer
+             * should have the data of the *whole* block (merged from
+             * partial blocks stored in multiple archives files). */
         } else {
             rar->cstate.switch_multivolume = 0;
 
@@ -2735,6 +2779,8 @@ static int do_unstore_file(struct archive_read* a,
         return ARCHIVE_FATAL;
     }
 
+    // TODO: support multivolume
+
     if(buf)    *buf = p;
     if(size)   *size = to_read;
     if(offset) *offset = rar->file.read_offset;
@@ -2966,8 +3012,12 @@ static int rar5_cleanup(struct archive_read *a)
     if(rar->cstate.filtered_buf)
         free(rar->cstate.filtered_buf);
 
+    if(rar->vol.push_buf)
+        free(rar->vol.push_buf);
+
     cdeque_clear(&rar->cstate.filters);
     cdeque_free(&rar->cstate.filters);
+
     free(rar);
     a->format->data = NULL;
 
