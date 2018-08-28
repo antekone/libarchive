@@ -219,6 +219,7 @@ struct generic_header {
 };
 
 struct multivolume {
+    uint8_t archive_split : 1;
     int expected_vol_no;
     uint8_t* push_buf;
 };
@@ -734,29 +735,29 @@ static int read_ahead(struct archive_read* a, size_t how_many, const uint8_t** p
 }
 
 static int consume(struct archive_read* a, int64_t how_many) {
-    LOG("consume: 0x%lx bytes", how_many);
+    /*LOG("consume: 0x%lx bytes", how_many);*/
     int ret;
 
-#ifdef DEBUG
-    const uint8_t* p;
-    read_ahead(a, 4, &p);
+/*#ifdef DEBUG*/
+    /*const uint8_t* p;*/
+    /*read_ahead(a, 4, &p);*/
 
-    printf("pre consume: ");
-    for(int i = 0; i < 4; i++) { printf("%02x ", p[i]); }
-    printf("\n");
-#endif
+    /*printf("pre consume: ");*/
+    /*for(int i = 0; i < 4; i++) { printf("%02x ", p[i]); }*/
+    /*printf("\n");*/
+/*#endif*/
 
     ret = 
         how_many == __archive_read_consume(a, how_many)
         ? ARCHIVE_OK
         : ARCHIVE_FATAL;
 
-#ifdef DEBUG
-    read_ahead(a, 4, &p);
-    printf("post consume: ");
-    for(int i = 0; i < 4; i++) { printf("%02x ", p[i]); }
-    printf("\n");
-#endif
+/*#ifdef DEBUG*/
+    /*read_ahead(a, 4, &p);*/
+    /*printf("post consume: ");*/
+    /*for(int i = 0; i < 4; i++) { printf("%02x ", p[i]); }*/
+    /*printf("\n");*/
+/*#endif*/
 
     return ret;
 }
@@ -1239,7 +1240,7 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
         if(!read_var_sized(a, &data_size, NULL))
             return ARCHIVE_EOF;
 
-        LOG("setting bytes_remaining to: %zx", data_size);
+        /*LOG("setting bytes_remaining to: %zx", data_size);*/
         rar->file.bytes_remaining = data_size;
     } else {
         rar->file.bytes_remaining = 0;
@@ -1484,6 +1485,8 @@ static int process_head_main(struct archive_read* a, struct rar5* rar, struct ar
     return ARCHIVE_OK;
 }
 
+static int scan_for_signature(struct archive_read* a);
+
 static int process_base_block(struct archive_read* a, struct rar5* rar, struct archive_entry* entry) {
     uint32_t hdr_crc, computed_crc;
     size_t raw_hdr_size, hdr_size_len, hdr_size;
@@ -1496,7 +1499,7 @@ static int process_base_block(struct archive_read* a, struct rar5* rar, struct a
         return ARCHIVE_EOF;
     }
 
-    LOG("hdr_crc=%08x", hdr_crc);
+    /*LOG("hdr_crc=%08x", hdr_crc);*/
 
     if(!read_var_sized(a, &raw_hdr_size, &hdr_size_len)) {
         LOG("can't read hdr_size");
@@ -1545,7 +1548,7 @@ static int process_base_block(struct archive_read* a, struct rar5* rar, struct a
         HEAD_CRYPT = 0x04, HEAD_ENDARC = 0x05, HEAD_UNKNOWN = 0xff,
     };
 
-    LOG("header_id=%02lx", header_id);
+    /*LOG("header_id=%02lx", header_id);*/
     switch(header_id) {
         case HEAD_MAIN:
             ret = process_head_main(a, rar, entry, header_flags);
@@ -1561,14 +1564,22 @@ static int process_base_block(struct archive_read* a, struct rar5* rar, struct a
             return ret;
         case HEAD_FILE:
             ret = process_head_file(a, rar, entry, header_flags);
-            // TODO if this block didn't have any data in it, retry
-            // TODO to next block.
+            if(rar->generic.split_after) 
+                rar->vol.archive_split = 1;
+
             return ret;
         case HEAD_CRYPT:
             return ARCHIVE_FATAL;
         case HEAD_ENDARC:
             rar->main.endarc = 1;
-            return ARCHIVE_EOF;
+
+            if(rar->vol.archive_split == 1) {
+                scan_for_signature(a);
+                rar->vol.archive_split = 0;
+                return ARCHIVE_OK;
+            } else {
+                return ARCHIVE_EOF;
+            }
         case HEAD_MARK:
             // TODO check if returning EOF on HEAD_MARK is really a proper
             // thing to do
@@ -1624,7 +1635,7 @@ static int rar5_read_header(struct archive_read *a, struct archive_entry *entry)
     }
 
     do {
-        LOG("-> parsing base header block");
+        /*LOG("-> parsing base header block");*/
         ret = process_base_block(a, rar, entry);
     } while(ret == ARCHIVE_RETRY);
 
@@ -1948,7 +1959,7 @@ static int parse_tables(struct archive_read* a, struct rar5* rar, const uint8_t*
 static int parse_block_header(const uint8_t* p, ssize_t* block_size, struct compressed_block_header* hdr) {
     memcpy(hdr, p, sizeof(struct compressed_block_header));
 
-    LOG("parsing block header: ptr is %02x %02x %02x %02x", p[0], p[1], p[2], p[3]);
+    /*LOG("parsing block header: ptr is %02x %02x %02x %02x", p[0], p[1], p[2], p[3]);*/
     if(hdr->block_flags.byte_count > 2) {
         LOG("error: block header byte_count is %d", hdr->block_flags.byte_count);
         return ARCHIVE_FATAL;
@@ -2422,10 +2433,10 @@ static int merge_block(struct archive_read* a, struct rar5* rar, ssize_t block_s
     ssize_t cur_block_size = *pcur_block_size;
     const uint8_t* lp;
 
-    LOG("*** multi-archive case, block part: %zx bytes, full block: %zx bytes",
-            cur_block_size, block_size);
+    /*LOG("*** multi-archive case, block part: %zx bytes, full block: %zx bytes",*/
+            /*cur_block_size, block_size);*/
 
-    LOG("*** bytes_remaining=%zx", rar->file.bytes_remaining);
+    /*LOG("*** bytes_remaining=%zx", rar->file.bytes_remaining);*/
     if(cur_block_size != rar->file.bytes_remaining) {
         LOG("*** placeholder, need to implement a loop here!");
         exit(1);
@@ -2434,7 +2445,7 @@ static int merge_block(struct archive_read* a, struct rar5* rar, ssize_t block_s
     rar->cstate.switch_multivolume = 1;
     rar->vol.expected_vol_no = rar->main.vol_no + 1;
 
-    LOG("*** part%03d -> part%03d", 1 + rar->main.vol_no, 1 + rar->vol.expected_vol_no);
+    /*LOG("*** part%03d -> part%03d", 1 + rar->main.vol_no, 1 + rar->vol.expected_vol_no);*/
 
     if(rar->vol.push_buf)
         free((void*) rar->vol.push_buf);
@@ -2485,7 +2496,7 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
     const uint8_t* p;
     int ret;
 
-    LOG("--- process block");
+    /*LOG("--- process block");*/
 
     if(rar->cstate.block_parsing_finished) {
         rar->cstate.block_parsing_finished = 0;
@@ -2495,7 +2506,7 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
             return ERROR_EOF;
         }
 
-        LOG("%02x %02x %02x %02x", p[0], p[1], p[2], p[3]);
+        /*LOG("%02x %02x %02x %02x", p[0], p[1], p[2], p[3]);*/
 
         // Read block_size by parsing block header. Validate the header by
         // calculating CRC byte stored inside the header. Size of the header
@@ -2583,9 +2594,9 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
 
     if(rar->cstate.block_parsing_finished && !rar->cstate.switch_multivolume) {
         if(rar->cstate.cur_block_size > 0) {
-            LOG("bytes_remaining -= 0x%zx", rar->cstate.cur_block_size);
+            /*LOG("bytes_remaining -= 0x%zx", rar->cstate.cur_block_size);*/
             rar->file.bytes_remaining -= rar->cstate.cur_block_size;
-            LOG("new bytes_remaining=0x%zx", rar->file.bytes_remaining);
+            /*LOG("new bytes_remaining=0x%zx", rar->file.bytes_remaining);*/
             if(ARCHIVE_OK != consume(a, rar->cstate.cur_block_size)) {
                 LOG("fail when consuming");
                 return ARCHIVE_FATAL;
@@ -2594,7 +2605,7 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
     } else if(rar->cstate.switch_multivolume) {
         rar->cstate.switch_multivolume = 0;
         //rar->file.bytes_remaining -= rar->cstate.cur_block_size;
-        LOG("new bytes_remaining=0x%zx", rar->file.bytes_remaining);
+        /*LOG("new bytes_remaining=0x%zx", rar->file.bytes_remaining);*/
     }
 
     if(rar->cstate.block_parsing_finished && rar->last_block_hdr.block_flags.is_last_block) {
