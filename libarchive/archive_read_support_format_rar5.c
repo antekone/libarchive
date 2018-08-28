@@ -90,7 +90,7 @@ struct file_header {
     int64_t last_offset;         /* used in sanity checks */
     int64_t last_size;           /* used in sanity checks */
 
-    int solid : 1;               /* is this a solid stream? */
+    uint8_t solid : 1;           /* is this a solid stream? */
 
     /* optional time fields */
     uint64_t e_mtime;
@@ -1305,7 +1305,7 @@ static int process_head_file(struct archive_read* a, struct rar5* rar, struct ar
     rar->cstate.method = c_method;
     rar->cstate.version = c_version + 50;
 
-    rar->file.solid = compression_info & SOLID;
+    rar->file.solid = (compression_info & SOLID) > 0;
 
     if(!read_var_sized(a, &host_os, NULL))
         return ARCHIVE_EOF;
@@ -1422,8 +1422,8 @@ static int process_head_main(struct archive_read* a, struct rar5* rar, struct ar
         LOCK = 0x0010,           /* readonly flag, not used */
     };
 
-    rar->main.volume = archive_flags & VOLUME;
-    rar->main.solid = archive_flags & SOLID;
+    rar->main.volume = (archive_flags & VOLUME) > 0;
+    rar->main.solid = (archive_flags & SOLID) > 0;
 
     if(archive_flags & VOLUME_NUMBER) {
         uint64_t v;
