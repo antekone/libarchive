@@ -56,7 +56,6 @@
 
 // #define CHECK_CRC_ON_SOLID_SKIP
 // #define DONT_FAIL_ON_CRC_ERROR
-#define DEBUG
 
 #define HUFF_NC 306
 #define HUFF_DC 64
@@ -64,6 +63,23 @@
 #define HUFF_RC 44
 #define HUFF_BC 20
 #define HUFF_TABLE_SIZE (HUFF_NC + HUFF_DC + HUFF_RC + HUFF_LDC)
+
+/* Real RAR5 magic number is:
+ *
+ * 0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00
+ * "Rar!→•☺·\x00"
+ *
+ * It's stored in `rar5_signature` after XOR'ing it with 0xA1, because I don't
+ * want to put this magic sequence in each binary that uses libarchive, so
+ * applications that scan through the file for this marker won't trigger on
+ * this "false" one. 
+ *
+ * The array itself is decrypted in `rar5_init` function. */
+
+unsigned char rar5_signature[] = { 243, 192, 211, 128, 187, 166, 160, 161 };
+const ssize_t rar5_signature_size = sizeof(rar5_signature);
+const size_t g_unpack_buf_chunk_size = 1024;
+const size_t g_unpack_window_size = 0x20000;
 
 static int rar5_read_data_skip(struct archive_read *a);
 
@@ -678,7 +694,18 @@ static int dist_cache_touch(struct rar5* rar, int index) {
 }
 
 static int rar5_init(struct rar5* rar) {
+    ssize_t i;
+
     memset(rar, 0, sizeof(struct rar5));
+
+    /* Decrypt the magic signature pattern. Check the comment near the
+     * `rar5_signature` symbol to read the rationale behind this. */
+
+    if(rar5_signature[0] == 243) {
+        for(i = 0; i < rar5_signature_size; i++) {
+            rar5_signature[i] ^= 0xA1;
+        }
+    }
 
     if(CDE_OK != cdeque_init(&rar->cstate.filters, 8192))
         return ARCHIVE_FATAL;
@@ -700,11 +727,6 @@ static void reset_file_context(struct rar5* rar) {
 
     cdeque_clear(&rar->cstate.filters);
 }
-
-const unsigned char rar5_signature[] = { 0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00 };
-const ssize_t rar5_signature_size = sizeof(rar5_signature);
-const size_t g_unpack_buf_chunk_size = 1024;
-const size_t g_unpack_window_size = 0x20000;
 
 static inline int get_archive_read(struct archive* a, struct archive_read** ar) {
     *ar = (struct archive_read*) a;
@@ -738,26 +760,10 @@ static int consume(struct archive_read* a, int64_t how_many) {
     /*LOG("consume: 0x%lx bytes", how_many);*/
     int ret;
 
-/*#ifdef DEBUG*/
-    /*const uint8_t* p;*/
-    /*read_ahead(a, 4, &p);*/
-
-    /*printf("pre consume: ");*/
-    /*for(int i = 0; i < 4; i++) { printf("%02x ", p[i]); }*/
-    /*printf("\n");*/
-/*#endif*/
-
     ret = 
         how_many == __archive_read_consume(a, how_many)
         ? ARCHIVE_OK
         : ARCHIVE_FATAL;
-
-/*#ifdef DEBUG*/
-    /*read_ahead(a, 4, &p);*/
-    /*printf("post consume: ");*/
-    /*for(int i = 0; i < 4; i++) { printf("%02x ", p[i]); }*/
-    /*printf("\n");*/
-/*#endif*/
 
     return ret;
 }
