@@ -86,7 +86,6 @@ static int rar5_read_data_skip(struct archive_read *a);
 struct file_header {
     ssize_t bytes_remaining;
     uint64_t read_offset;        /* used during extraction of stored files */
-    uint64_t prev_read_bytes;
     int64_t last_offset;         /* used in sanity checks */
     int64_t last_size;           /* used in sanity checks */
 
@@ -2441,7 +2440,7 @@ static int merge_block(struct archive_read* a, struct rar5* rar, ssize_t block_s
     ssize_t cur_block_size = *pcur_block_size;
     const uint8_t* lp;
 
-    /*LOG("*** multi-archive case, block part: %zx bytes, full block: %zx bytes",*/
+    /*LOG("*** multi-archive case, bytes remaining: %zx bytes, full block size: %zx bytes",*/
             /*cur_block_size, block_size);*/
 
     /*LOG("*** bytes_remaining=%zx", rar->file.bytes_remaining);*/
@@ -2452,7 +2451,7 @@ static int merge_block(struct archive_read* a, struct rar5* rar, ssize_t block_s
 
     rar->cstate.switch_multivolume = 1;
 
-    /*LOG("*** part%03d -> part%03d", 1 + rar->main.vol_no, 1 + rar->vol.expected_vol_no);*/
+    /*LOG("*** part%03d -> part%03d", 1 + rar->main.vol_no, 2 + rar->main.vol_no);*/
 
     if(rar->vol.push_buf)
         free((void*) rar->vol.push_buf);
@@ -2784,16 +2783,16 @@ static int do_unstore_file(struct archive_read* a,
 {
     const uint8_t* p;
 
-    if(ARCHIVE_OK != consume(a, rar->file.prev_read_bytes)) {
-        LOG("consume failed");
-        return ARCHIVE_FATAL;
-    }
-
     size_t to_read = rar5_min(rar->file.bytes_remaining, 64 * 1024);
 
     if(!read_ahead(a, to_read, &p)) {
         LOG("I/O error during do_unstore_file");
         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT, "I/O error when unstoring file");
+        return ARCHIVE_FATAL;
+    }
+
+    if(ARCHIVE_OK != consume(a, to_read)) {
+        LOG("consume failed");
         return ARCHIVE_FATAL;
     }
 
@@ -2803,7 +2802,6 @@ static int do_unstore_file(struct archive_read* a,
     if(size)   *size = to_read;
     if(offset) *offset = rar->file.read_offset;
 
-    rar->file.prev_read_bytes = to_read;
     rar->file.bytes_remaining -= to_read;
     rar->file.read_offset += to_read;
     update_crc(rar, p, to_read);
@@ -2994,19 +2992,17 @@ static int rar5_read_data_skip(struct archive_read *a) {
             }
         }
 
-        rar->file.prev_read_bytes = 0;
         return ARCHIVE_OK;
     } else {
         /* In standard archives, we can just jump over the compressed stream.
          * Each file in non-solid archives starts from an empty window buffer.
          */
 
-        if(ARCHIVE_OK != consume(a, rar->file.bytes_remaining + rar->file.prev_read_bytes)) {
+        if(ARCHIVE_OK != consume(a, rar->file.bytes_remaining)) {
             LOG("consume failed");
             return ARCHIVE_FATAL;
         }
 
-        rar->file.prev_read_bytes = 0;
         rar->file.bytes_remaining = 0;
         return ARCHIVE_OK;
     }
