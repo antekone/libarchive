@@ -1573,10 +1573,16 @@ static int process_base_block(struct archive_read* a, struct rar5* rar, struct a
         case HEAD_ENDARC:
             rar->main.endarc = 1;
 
-            if(rar->vol.archive_split == 1) {
-                scan_for_signature(a);
+            if(rar->main.volume && rar->vol.archive_split == 1) {
+                ret = scan_for_signature(a);
+
                 rar->vol.archive_split = 0;
-                return ARCHIVE_OK;
+                rar->vol.expected_vol_no = rar->main.vol_no + 1;
+
+                if(ret == ARCHIVE_FATAL)
+                    return ARCHIVE_EOF;
+                else
+                    return ARCHIVE_OK;
             } else {
                 return ARCHIVE_EOF;
             }
@@ -2394,14 +2400,10 @@ static int advance_multivolume(struct archive_read* a, struct rar5* rar) {
     while(1) {
         if(rar->main.endarc == 1) {
             rar->main.endarc = 0;
-            lret = scan_for_signature(a);
-            if(lret == ARCHIVE_OK) {
-                while(ARCHIVE_RETRY == skip_base_block(a, rar));
-                /* TODO: verify this was a FILE block */
-                break;
-            } else {
-                return lret;
-            }
+            while(ARCHIVE_RETRY == skip_base_block(a, rar));
+
+            /* TODO: verify this was a FILE block */
+            break;
         } else {
             /* Skip current base block. In order to properly skip it,
              * we weally need to simply parse it and discard the results. */
@@ -2443,7 +2445,6 @@ static int merge_block(struct archive_read* a, struct rar5* rar, ssize_t block_s
     }
 
     rar->cstate.switch_multivolume = 1;
-    rar->vol.expected_vol_no = rar->main.vol_no + 1;
 
     /*LOG("*** part%03d -> part%03d", 1 + rar->main.vol_no, 1 + rar->vol.expected_vol_no);*/
 
