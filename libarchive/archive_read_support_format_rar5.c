@@ -234,7 +234,6 @@ struct generic_header {
 };
 
 struct multivolume {
-    uint8_t archive_split : 1;
     int expected_vol_no;
     uint8_t* push_buf;
 };
@@ -714,6 +713,7 @@ static int rar5_init(struct rar5* rar) {
 
 static void reset_file_context(struct rar5* rar) {
     memset(&rar->file, 0, sizeof(rar->file));
+    blake2sp_init(&rar->file.b2state, 32);
     
     if(rar->main.solid) {
         rar->cstate.solid_offset += rar->cstate.write_ptr;
@@ -756,7 +756,7 @@ static int read_ahead(struct archive_read* a, size_t how_many, const uint8_t** p
 }
 
 static int consume(struct archive_read* a, int64_t how_many) {
-    LOG("consume: 0x%lx bytes", how_many);
+    /*LOG("consume: 0x%lx bytes", how_many);*/
     int ret;
 
     ret = 
@@ -1053,7 +1053,6 @@ static int parse_file_extra_hash(struct archive_read* a, struct rar5* rar, ssize
         const int hash_size = sizeof(rar->file.blake2sp);
 
         rar->file.has_blake2 = 1;
-        blake2sp_init(&rar->file.b2state, 32);
 
         if(!read_ahead(a, hash_size, &p))
             return ARCHIVE_EOF;
@@ -1569,19 +1568,15 @@ static int process_base_block(struct archive_read* a, struct rar5* rar, struct a
             return ret;
         case HEAD_FILE:
             ret = process_head_file(a, rar, entry, header_flags);
-            if(rar->generic.split_after) 
-                rar->vol.archive_split = 1;
-
             return ret;
         case HEAD_CRYPT:
             return ARCHIVE_FATAL;
         case HEAD_ENDARC:
             rar->main.endarc = 1;
 
-            if(rar->main.volume && rar->vol.archive_split == 1) {
+            if(rar->main.volume) {
                 ret = scan_for_signature(a);
 
-                rar->vol.archive_split = 0;
                 rar->vol.expected_vol_no = rar->main.vol_no + 1;
 
                 if(ret == ARCHIVE_FATAL)
@@ -1648,7 +1643,7 @@ static int rar5_read_header(struct archive_read *a, struct archive_entry *entry)
     do {
         /*LOG("-> parsing base header block");*/
         ret = process_base_block(a, rar, entry);
-    } while(ret == ARCHIVE_RETRY);
+    } while(ret == ARCHIVE_RETRY || (rar->main.endarc > 0 && ret == ARCHIVE_OK));
 
     return ret;
 }
@@ -2373,6 +2368,8 @@ static int scan_for_signature(struct archive_read* a) {
     const uint8_t* p;
     const int chunk_size = 512;
 
+    LOG("(scanning for signature...)");
+
     while(1) {
         if(!read_ahead(a, chunk_size, &p))
             return ARCHIVE_EOF;
@@ -2437,7 +2434,7 @@ static int advance_multivolume(struct archive_read* a, struct rar5* rar) {
 
 static int merge_block(struct archive_read* a, struct rar5* rar, ssize_t block_size, const uint8_t** p) {
     int ret;
-    ssize_t chunk_size, cur_block_size, partial_offset = 0;
+    ssize_t cur_block_size, partial_offset = 0;
     const uint8_t* lp;
 
     LOG("*** multi-archive case, full block size: 0x%zx bytes", block_size);
@@ -2508,7 +2505,7 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
     const uint8_t* p;
     int ret;
 
-    LOG("--- process block, bytes remaining 0x%08zx", rar->file.bytes_remaining);
+    /*LOG("--- process block, bytes remaining 0x%08zx", rar->file.bytes_remaining);*/
 
     if(rar->file.bytes_remaining == 0) {
         advance_multivolume(a, rar);
@@ -2522,7 +2519,7 @@ static int process_block(struct archive_read* a, struct rar5* rar) {
             return ERROR_EOF;
         }
 
-        LOG("%02x %02x %02x %02x", p[0], p[1], p[2], p[3]);
+        /*LOG("%02x %02x %02x %02x", p[0], p[1], p[2], p[3]);*/
 
         // Read block_size by parsing block header. Validate the header by
         // calculating CRC byte stored inside the header. Size of the header
@@ -2928,7 +2925,7 @@ static int finalize_file(struct archive_read* a, struct rar5* rar) {
             (void) blake2sp_final(&rar->file.b2state, b2_buf, 32);
 
             if(memcmp(&rar->file.blake2sp, b2_buf, 32) != 0) {
-                LOG("Checksum error: BLAKE2sp");
+                LOG("Checksum error: BLAKE2sp (%08x/%08x)", *(uint32_t*)rar->file.blake2sp, *(uint32_t*)b2_buf);
 #ifndef DONT_FAIL_ON_CRC_ERROR
                 archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
                                   "Checksum error: BLAKE2");
@@ -2936,7 +2933,7 @@ static int finalize_file(struct archive_read* a, struct rar5* rar) {
                 return ARCHIVE_FATAL;
 #endif
             } else {
-                LOG("Checksum OK: BLAKE2sp");
+                LOG("Checksum OK: BLAKE2sp (%08x/%08x)", *(uint32_t*)rar->file.blake2sp, *(uint32_t*)b2_buf);
             }
         }
     }
