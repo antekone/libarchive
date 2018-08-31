@@ -158,7 +158,7 @@ struct comp_state {
     int flags;
     int method;
     int version;
-    size_t window_size;
+    ssize_t window_size;
     uint8_t* window_buf;
     uint8_t* filtered_buf;
     const uint8_t* block_buf;
@@ -597,18 +597,18 @@ static int run_filter(struct rar5* rar, struct filter_info* flt) {
 }
 
 static void push_data(struct rar5* rar, const uint8_t* buf, ssize_t idx_begin, ssize_t idx_end) {
-    const int mask = rar->cstate.window_mask;
+    const int wmask = rar->cstate.window_mask;
 
     /*LOG("push_data: idx_begin=%zx, idx_end=%zx", idx_begin, idx_end);*/
 
     idx_begin += rar->cstate.solid_offset;
     idx_end += rar->cstate.solid_offset;
 
-    if((idx_begin & mask) > (idx_end & mask)) {
-        ssize_t frag1_size = rar->cstate.window_size - (idx_begin & mask);
-        ssize_t frag2_size = idx_end & mask;
+    if((idx_begin & wmask) > (idx_end & wmask)) {
+        ssize_t frag1_size = rar->cstate.window_size - (idx_begin & wmask);
+        ssize_t frag2_size = idx_end & wmask;
 
-        ssize_t src_offset_1 = (rar->cstate.solid_offset + rar->cstate.last_write_ptr) & mask;
+        ssize_t src_offset_1 = (rar->cstate.solid_offset + rar->cstate.last_write_ptr) & wmask;
         ssize_t src_offset_2 = 0;
 
         push_data_ready(rar,
@@ -624,8 +624,8 @@ static void push_data(struct rar5* rar, const uint8_t* buf, ssize_t idx_begin, s
         rar->cstate.last_write_ptr += frag1_size + frag2_size;
     } else {
         push_data_ready(rar,
-            buf + ((rar->cstate.solid_offset + rar->cstate.last_write_ptr) & mask),
-            idx_end - idx_begin,
+            buf + ((rar->cstate.solid_offset + rar->cstate.last_write_ptr) & wmask),
+            (idx_end - idx_begin) & wmask,
             rar->cstate.last_write_ptr);
 
         rar->cstate.last_write_ptr += idx_end - idx_begin;
@@ -745,9 +745,8 @@ static int read_ahead(struct archive_read* a, size_t how_many, const uint8_t** p
         return 0;
 
     ssize_t avail = -1;
-    /*LOG("read_ahead request how_many=0x%zx", how_many);*/
     *ptr = __archive_read_ahead(a, how_many, &avail);
-    /*LOG("read_ahead avail=0x%zx", avail);*/
+
     if(*ptr == NULL) {
         return 0;
     }
@@ -1401,8 +1400,6 @@ static int process_head_main(struct archive_read* a, struct rar5* rar, struct ar
     if(block_flags & HFL_EXTRA_DATA) {
         if(!read_var_sized(a, &extra_data_size, NULL))
             return ARCHIVE_EOF;
-
-        LOG("process_head_main: has extra data, size: 0x%08zx bytes", extra_data_size);
     } else {
         extra_data_size = 0;
     }
@@ -1431,16 +1428,22 @@ static int process_head_main(struct archive_read* a, struct rar5* rar, struct ar
         }
 
         rar->main.vol_no = (int) v;
-        LOG("volume number: %d", rar->main.vol_no);
     } else {
         rar->main.vol_no = 0;
     }
 
-    if(rar->vol.expected_vol_no > 0 && rar->main.vol_no != rar->vol.expected_vol_no) {
-        LOG("fatal: expected volume number (%d) doesn't match physical volume number (%d)",
-            rar->vol.expected_vol_no, rar->main.vol_no);
+    if(rar->vol.expected_vol_no > 0 && 
+        rar->main.vol_no != rar->vol.expected_vol_no) 
+    {
+        LOG("eof: expected volume number (%d) doesn't match physical volume "
+            "number (%d)", rar->vol.expected_vol_no, rar->main.vol_no);
 
-        return ARCHIVE_FATAL;
+        /* Returning EOF instead of FATAL because of strange libarchive
+         * behavior. When opening multiple files via
+         * archive_read_open_filenames(), after reading up the whole last file,
+         * the __archive_read_ahead function wraps up to the first archive
+         * instead of returning EOF. */
+        return ARCHIVE_EOF;
     }
 
     if(extra_data_size == 0) {
@@ -1485,7 +1488,6 @@ static int process_head_main(struct archive_read* a, struct rar5* rar, struct ar
             return ARCHIVE_FATAL;
     }
 
-    LOG("main header parsing ok");
     return ARCHIVE_OK;
 }
 
@@ -1562,7 +1564,8 @@ static int process_base_block(struct archive_read* a, struct rar5* rar, struct a
             // HEAD_FILE/HEAD_SERVICE.
             if(ret == ARCHIVE_OK)
                 return ARCHIVE_RETRY;
-            break;
+
+            return ret;
         case HEAD_SERVICE:
             ret = process_head_service(a, rar, entry, header_flags);
             return ret;
@@ -2170,8 +2173,8 @@ static int do_uncompress_block(struct archive_read* a,
     int noisy = 0;
 
     while(1) {
-        if(rar->cstate.write_ptr - rar->cstate.last_write_ptr > (4 * 1024 * 1024)) {
-            // Don't allow growing data by more than 1 MB at a time.
+        if(rar->cstate.write_ptr - rar->cstate.last_write_ptr > (rar->cstate.window_size >> 1)) {
+            // Don't allow growing data by more than half of the window size at a time.
             break;
         }
 
@@ -2368,8 +2371,6 @@ static int scan_for_signature(struct archive_read* a) {
     const uint8_t* p;
     const int chunk_size = 512;
 
-    LOG("(scanning for signature...)");
-
     while(1) {
         if(!read_ahead(a, chunk_size, &p))
             return ARCHIVE_EOF;
@@ -2437,10 +2438,6 @@ static int merge_block(struct archive_read* a, struct rar5* rar, ssize_t block_s
     ssize_t cur_block_size, partial_offset = 0;
     const uint8_t* lp;
 
-    LOG("*** multi-archive case, full block size: 0x%zx bytes", block_size);
-    LOG("*** bytes_remaining=0x%zx", rar->file.bytes_remaining);
-    LOG("*** part%03d -> part%03d", 1 + rar->main.vol_no, 2 + rar->main.vol_no);
-
     rar->cstate.switch_multivolume = 1;
 
     if(rar->vol.push_buf)
@@ -2455,15 +2452,12 @@ static int merge_block(struct archive_read* a, struct rar5* rar, ssize_t block_s
     while(1) {
         cur_block_size = rar5_min(rar->file.bytes_remaining, block_size - partial_offset);
 
-        LOG("[switch] reading 0x%zx bytes", cur_block_size);
         if(!read_ahead(a, cur_block_size, &lp))
             return ARCHIVE_EOF;
 
-        LOG("[switch] copying to buffer at offset 0x%08zx, len 0x%08zx", partial_offset, cur_block_size);
-
         if(partial_offset + cur_block_size > block_size) {
             LOG("[switch] out of bounds error, exit");
-            exit(1);
+            return ARCHIVE_FATAL;
         }
 
         memcpy(&rar->vol.push_buf[partial_offset], lp, cur_block_size);
@@ -2473,10 +2467,8 @@ static int merge_block(struct archive_read* a, struct rar5* rar, ssize_t block_s
 
         partial_offset += cur_block_size;
         rar->file.bytes_remaining -= cur_block_size;
-        LOG("new partial offset is 0x%08zx, new bytes remaining is 0x%08zx", partial_offset, rar->file.bytes_remaining);
 
         if(partial_offset == block_size) {
-            LOG("break#1");
             break;
         } else if(partial_offset > block_size) {
             LOG("switching multiarchives ate too much");
@@ -2484,7 +2476,6 @@ static int merge_block(struct archive_read* a, struct rar5* rar, ssize_t block_s
         }
 
         if(rar->file.bytes_remaining == 0) {
-            LOG("--> advancing");
             ret = advance_multivolume(a, rar);
             if(ret != ARCHIVE_OK) {
                 LOG("error: advance multivolume didn't return ARCHIVE_OK");
@@ -2646,7 +2637,7 @@ static int use_data(struct rar5* rar, const void** buf, size_t* size, int64_t* o
             d->used = 0;
 
             /*LOG("using data: buf=%zx, size=%zx, offset=%lx (new -> %lx)", (size_t) d->buf, d->size, d->offset, d->offset + d->size);*/
-            update_crc(rar, d->buf, d->size);
+            /*update_crc(rar, d->buf, d->size);*/
             return ARCHIVE_OK;
         }
     }
@@ -2664,7 +2655,7 @@ static void push_data_ready(struct rar5* rar, const uint8_t* buf, size_t size, i
         asm("int $3");
     }
 
-    /*ssize_t b = (ssize_t) buf - (ssize_t) rar->cstate.window_buf;*/
+    ssize_t b = (ssize_t) buf - (ssize_t) rar->cstate.window_buf;
     /*LOG("pushing data ready: buf=%zx, size=%zx, offset=%lx", b, size, offset);*/
 
     for(i = 0; i < rar5_countof(rar->cstate.dready); i++) {
@@ -2676,6 +2667,7 @@ static void push_data_ready(struct rar5* rar, const uint8_t* buf, size_t size, i
             d->offset = offset;
             rar->file.last_offset = offset;
             rar->file.last_size = size;
+            update_crc(rar, d->buf, d->size);
             return;
         }
     }
@@ -2728,7 +2720,7 @@ static int do_uncompress_file(struct archive_read* a,
             }
 
             if(rar->cstate.last_write_ptr == rar->cstate.write_ptr) {
-                LOG("no data in this block, continuing");
+                /*LOG("no data in this block, continuing");*/
                 continue;
             }
 
@@ -2956,8 +2948,6 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
         LOG("do_unpack returned error: %d", ret);
         return ret;
     }
-
-    (void) use_data(rar, buff, size, offset);
 
     if(rar->file.bytes_remaining == 0 && rar->cstate.last_write_ptr == rar->cstate.write_ptr) {
         /* If all bytes of current file were processed, run finalization.
