@@ -640,29 +640,48 @@ static int apply_filters(struct rar5* rar) {
     struct filter_info* flt;
     int ret;
 
-    /*LOG("processing filters, last_write_ptr=0x%zx, write_ptr=0x%zx", rar->cstate.last_write_ptr, rar->cstate.write_ptr);*/
-
     rar->cstate.all_filters_applied = 0;
-    while(CDE_OK == cdeque_front(&rar->cstate.filters, cdeque_filter_p(&flt))) {
-        if(rar->cstate.write_ptr > flt->block_start && rar->cstate.write_ptr >= flt->block_start + flt->block_length) {
+
+    /* Find a filter that can be applied to our data. The data needs to
+     * be fully unpacked before the filter can be run. */
+    while(CDE_OK == 
+            cdeque_front(&rar->cstate.filters, cdeque_filter_p(&flt))) 
+    {
+        /* Check if our unpacked data fully covers this filter's range. */
+        if(rar->cstate.write_ptr > flt->block_start && 
+                rar->cstate.write_ptr >= flt->block_start + flt->block_length) 
+        {
+            /* Check if we have some data pending to be written right before
+             * the filter's start offset. */
             if(rar->cstate.last_write_ptr == flt->block_start) {
-                /*LOG("will process filter %d 0x%08x-0x%08x", flt->type, flt->block_start, flt->block_start + flt->block_length - 1);*/
+                /* We can run the filter. */
+
+                /* Run the filter specified by descriptor `flt`. */
                 ret = run_filter(rar, flt);
+                
+                /* Check if the filter run was successfull or not. */
                 if(ret != ARCHIVE_OK) {
                     LOG("filter failure, returning error");
                     return ret;
                 }
 
-                /*LOG("filter executed, removing it from queue");*/
-                (void) cdeque_pop_front(&rar->cstate.filters, cdeque_filter_p(&flt));
-                return ARCHIVE_RETRY;
+                /* Filter descriptor won't be needed anymore after it's used,
+                 * so remove it from the filter list and free its memory. */
+                (void) cdeque_pop_front(&rar->cstate.filters, 
+                        cdeque_filter_p(&flt));
+
+                free(flt);
             } else {
-                /*LOG("not yet, will dump memory right before the filter");*/
-                push_window_data(rar, rar->cstate.last_write_ptr, flt->block_start);
-                return ARCHIVE_RETRY;
+                /* We can't run filters yet, dump the memory right before the
+                 * filter. */
+                push_window_data(rar, rar->cstate.last_write_ptr, 
+                        flt->block_start);
             }
+
+            /* Return 'filter applied or not needed' state to the caller. */
+            return ARCHIVE_RETRY;
         } else {
-            /*LOG("no, can't run this filter yet");*/
+            /* Can't run this filter yet. */
             break;
         }
     }
@@ -711,6 +730,25 @@ static int rar5_init(struct rar5* rar) {
     return ARCHIVE_OK;
 }
 
+static void free_filters(struct cdeque* d) {
+    /* Free any remaining filters. All filters should be naturally consumed by
+     * the unpacking function, so remaining filters after unpacking normally
+     * mean that unpacking wasn't successfull. But still of course we shouldn't
+     * leak memory in such case. */
+
+    /* cdeque_size() is a fast operation, so we can use it as a loop
+     * expression. */
+    while(cdeque_size(d) > 0) {
+        struct filter_info* f = NULL;
+
+        /* Pop_front will also decrease the collection's size. */
+        if(CDE_OK == cdeque_pop_front(d, cdeque_filter_p(&f)) && f != NULL)
+            free(f);
+    }
+
+    cdeque_clear(d);
+}
+
 static void reset_file_context(struct rar5* rar) {
     memset(&rar->file, 0, sizeof(rar->file));
     blake2sp_init(&rar->file.b2state, 32);
@@ -724,7 +762,7 @@ static void reset_file_context(struct rar5* rar) {
     rar->cstate.write_ptr = 0;
     rar->cstate.last_write_ptr = 0;
 
-    cdeque_clear(&rar->cstate.filters);
+    free_filters(&rar->cstate.filters);
 }
 
 static inline int get_archive_read(struct archive* a, struct archive_read** ar) {
@@ -2655,7 +2693,7 @@ static void push_data_ready(struct rar5* rar, const uint8_t* buf, size_t size, i
         asm("int $3");
     }
 
-    ssize_t b = (ssize_t) buf - (ssize_t) rar->cstate.window_buf;
+    /*ssize_t b = (ssize_t) buf - (ssize_t) rar->cstate.window_buf;*/
     /*LOG("pushing data ready: buf=%zx, size=%zx, offset=%lx", b, size, offset);*/
 
     for(i = 0; i < rar5_countof(rar->cstate.dready); i++) {
@@ -3032,7 +3070,7 @@ static int rar5_cleanup(struct archive_read *a)
     if(rar->vol.push_buf)
         free(rar->vol.push_buf);
 
-    cdeque_clear(&rar->cstate.filters);
+    free_filters(&rar->cstate.filters);
     cdeque_free(&rar->cstate.filters);
 
     free(rar);
