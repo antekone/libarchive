@@ -654,6 +654,12 @@ static int apply_filters(struct archive_read* a) {
 
     rar->cstate.all_filters_applied = 0;
 
+    // TODO: change the name of the function to apply_1st_filter or similar?
+    // maybe remove this while() because it seems to not iterate at all.
+    // change surrounding comments to say that we're trying to run just
+    // the first filter, because filter list should be sorted.
+    // also remove this 'Find' 2 lines below.
+
     /* Find a filter that can be applied to our data. The data needs to
      * be fully unpacked before the filter can be run. */
     while(CDE_OK == 
