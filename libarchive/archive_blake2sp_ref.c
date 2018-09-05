@@ -40,7 +40,7 @@ static int blake2sp_init_leaf_param( blake2s_state *S, const blake2s_param *P )
   return err;
 }
 
-static int blake2sp_init_leaf( blake2s_state *S, size_t outlen, size_t keylen, uint64_t offset )
+static int blake2sp_init_leaf( blake2s_state *S, size_t outlen, size_t keylen, uint32_t offset )
 {
   blake2s_param P[1];
   P->digest_length = (uint8_t)outlen;
