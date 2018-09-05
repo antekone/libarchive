@@ -205,8 +205,8 @@ struct comp_state {
 
     /* Circular deque for storing filters. */
     struct cdeque filters;
-    ssize_t last_block_start;    /* Used for sanity checking. */
-    ssize_t last_block_length;   /* Used for sanity checking. */
+    int64_t last_block_start;    /* Used for sanity checking. */
+    int64_t last_block_length;   /* Used for sanity checking. */
 
     /* Distance cache used during lzss uncompression. */
     int dist_cache[4];
