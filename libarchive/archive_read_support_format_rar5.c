@@ -1086,10 +1086,10 @@ static int process_main_locator_extra_block(struct archive_read* a,
 static int parse_file_extra_hash(struct archive_read* a, struct rar5* rar, 
         ssize_t* extra_data_size) 
 {
-    uint64_t hash_type;
+    size_t hash_type;
     size_t value_len;
 
-    if(!read_var(a, &hash_type, &value_len))
+    if(!read_var_sized(a, &hash_type, &value_len))
         return ARCHIVE_EOF;
 
     *extra_data_size -= value_len;
@@ -1152,7 +1152,7 @@ static int parse_file_extra_htime(struct archive_read* a,
         ssize_t* extra_data_size) 
 {
     char unix_time = 0;
-    uint64_t flags;
+    size_t flags;
     size_t value_len;
 
     enum HTIME_FLAGS {
@@ -1163,7 +1163,7 @@ static int parse_file_extra_htime(struct archive_read* a,
         HAS_UNIX_NS   = 0x10,
     };
 
-    if(!read_var(a, &flags, &value_len))
+    if(!read_var_sized(a, &flags, &value_len))
         return ARCHIVE_EOF;
 
     *extra_data_size -= value_len;
@@ -1202,8 +1202,8 @@ static int process_head_file_extra(struct archive_read* a,
         struct archive_entry* e, struct rar5* rar, 
         ssize_t extra_data_size) 
 {
-    uint64_t extra_field_size;
-    uint64_t extra_field_id;
+    size_t extra_field_size;
+    size_t extra_field_id;
     int ret = ARCHIVE_FATAL;
     size_t var_size;
 
@@ -1213,7 +1213,7 @@ static int process_head_file_extra(struct archive_read* a,
     };
 
     while(extra_data_size > 0) {
-        if(!read_var(a, &extra_field_size, &var_size))
+        if(!read_var_sized(a, &extra_field_size, &var_size))
             return ARCHIVE_EOF;
 
         extra_data_size -= var_size;
@@ -1221,7 +1221,7 @@ static int process_head_file_extra(struct archive_read* a,
             return ARCHIVE_EOF;
         }
 
-        if(!read_var(a, &extra_field_id, &var_size))
+        if(!read_var_sized(a, &extra_field_id, &var_size))
             return ARCHIVE_EOF;
 
         extra_data_size -= var_size;
@@ -1475,7 +1475,7 @@ static int process_head_main(struct archive_read* a, struct rar5* rar,
     rar->main.solid = (archive_flags & SOLID) > 0;
 
     if(archive_flags & VOLUME_NUMBER) {
-        uint64_t v;
+        size_t v;
         if(!read_var_sized(a, &v, NULL)) {
             return ARCHIVE_EOF;
         }
