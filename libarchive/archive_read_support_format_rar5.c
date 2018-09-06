@@ -2452,6 +2452,10 @@ static int scan_for_signature(struct archive_read* a) {
     const int chunk_size = 512;
     ssize_t i;
 
+    /* Is it possible in libarchive to just skip everything until the
+     * end of the file? If so, it would be a better approach than the
+     * current implementation of this function. */
+
     while(1) {
         if(!read_ahead(a, chunk_size, &p))
             return ARCHIVE_EOF;
