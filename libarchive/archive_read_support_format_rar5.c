@@ -1330,8 +1330,6 @@ static int process_head_file(struct archive_read* a, struct rar5* rar,
     if(!read_var_sized(a, &file_attr, NULL))
         return ARCHIVE_EOF;
 
-    archive_entry_set_mode(entry, (unsigned short) file_attr);
-
     if(file_flags & UTIME) {
         if(!read_u32(a, &mtime))
             return ARCHIVE_EOF;
@@ -1358,6 +1356,28 @@ static int process_head_file(struct archive_read* a, struct rar5* rar,
 
     if(!read_var_sized(a, &host_os, NULL))
         return ARCHIVE_EOF;
+
+    enum HOST_OS {
+        HOST_WINDOWS = 0,
+        HOST_UNIX = 1,
+    };
+
+    if(host_os == HOST_WINDOWS) {
+        /* Host OS is Windows */
+        printf("host_os=%d\n", host_os);
+        printf("file_attr=0x%08x\n", file_attr);
+
+        /* TODO support this case */
+    } else if(host_os == HOST_UNIX) {
+        /* Host OS is Unix */
+        archive_entry_set_mode(entry, (unsigned short) file_attr);
+    } else {
+        /* Unknown host OS */
+        archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                "Unsupported Host OS: 0x%02x", host_os);
+
+        return ARCHIVE_FATAL;
+    }
 
     if(!read_var_sized(a, &name_size, NULL))
         return ARCHIVE_EOF;
