@@ -1128,6 +1128,12 @@ static int parse_file_extra_hash(struct archive_read* a, struct rar5* rar,
     return ARCHIVE_OK;
 }
 
+static uint64_t time_win_to_unix(uint64_t win_time) {
+    const size_t ns_in_sec = 10000000;
+    const uint64_t sec_to_unix = 11644473600LL;
+    return win_time / ns_in_sec - sec_to_unix;
+}
+
 static int parse_htime_item(struct archive_read* a, char unix_time,
         uint64_t* where, ssize_t* extra_data_size)
 {
@@ -1139,9 +1145,11 @@ static int parse_htime_item(struct archive_read* a, char unix_time,
         *extra_data_size -= 4;
         *where = (uint64_t) time_val;
     } else {
-        if(!read_u64(a, where))
+        uint64_t windows_time;
+        if(!read_u64(a, &windows_time))
             return ARCHIVE_EOF;
 
+        *where = time_win_to_unix(windows_time);
         *extra_data_size -= 8;
     }
 
@@ -1364,10 +1372,15 @@ static int process_head_file(struct archive_read* a, struct rar5* rar,
 
     if(host_os == HOST_WINDOWS) {
         /* Host OS is Windows */
-        printf("host_os=%d\n", host_os);
-        printf("file_attr=0x%08x\n", file_attr);
 
-        /* TODO support this case */
+        unsigned short mode = 0660;
+
+        if(is_dir)
+            mode |= AE_IFDIR;
+        else
+            mode |= AE_IFREG;
+
+        archive_entry_set_mode(entry, mode);
     } else if(host_os == HOST_UNIX) {
         /* Host OS is Unix */
         archive_entry_set_mode(entry, (unsigned short) file_attr);
