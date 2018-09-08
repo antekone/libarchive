@@ -1387,7 +1387,7 @@ static int process_head_file(struct archive_read* a, struct rar5* rar,
     } else {
         /* Unknown host OS */
         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
-                "Unsupported Host OS: 0x%02x", host_os);
+                "Unsupported Host OS: 0x%02x", (int) host_os);
 
         return ARCHIVE_FATAL;
     }
