@@ -2,6 +2,7 @@
  * Copyright (c) 2004-2013 Tim Kientzle
  * Copyright (c) 2011-2012,2014 Michihiro NAKAJIMA
  * Copyright (c) 2013 Konrad Kleine
+ * Copyright (c) 2018 Grzegorz Antoniak
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -43,6 +44,7 @@ __FBSDID("$FreeBSD: head/lib/libarchive/archive_read_support_format_zip.c 201102
  * refactoring) was added in 2014.
  */
 
+#define LOG(...) do { printf(__VA_ARGS__); puts(""); } while(0)
 #ifdef HAVE_ERRNO_H
 #include <errno.h>
 #endif
@@ -51,6 +53,9 @@ __FBSDID("$FreeBSD: head/lib/libarchive/archive_read_support_format_zip.c 201102
 #endif
 #ifdef HAVE_ZLIB_H
 #include <zlib.h>
+#endif
+#ifdef HAVE_LZMA_H
+#include <lzma.h>
 #endif
 
 #include "archive.h"
@@ -131,6 +136,8 @@ struct trad_enc_ctx {
 /**/
 #define MAX_DERIVED_KEY_BUF_SIZE	(AES_MAX_KEY_SIZE * 2 + 2)
 
+#define ZIPX_MIN(a, b) (((a) > (b)) ? (b) : (a))
+
 struct zip {
 	/* Structural information about the archive. */
 	struct archive_string	format_name;
@@ -170,6 +177,12 @@ struct zip {
 	size_t 			uncompressed_buffer_size;
 	z_stream		stream;
 	char			stream_valid;
+#endif
+
+#ifdef HAVE_LZMA_H
+    uint8_t         *zipx_uncompressed_buffer;
+    size_t          zipx_uncompressed_buffer_size;
+    lzma_stream     zipx_lzma_stream;
 #endif
 
 	struct archive_string_conv *sconv;
@@ -1296,6 +1309,266 @@ zip_read_data_none(struct archive_read *a, const void **_buff,
 	return (ARCHIVE_OK);
 }
 
+static int
+zipx_lzma_alone_init(struct archive_read *a, struct zip *zip)
+{
+    lzma_ret r;
+    const void* p;
+
+#pragma pack(push)
+#pragma pack(1)
+    struct _alone_header {
+        uint8_t bytes[5];
+        uint64_t uncompressed_size;
+    } alone_header;
+#pragma pack(pop)
+
+    /* To unpack ZIPX's "LZMA" (id 14) stream we can use standard liblzma that
+     * is a part of XZ Utils. The stream format stored inside ZIPX file is a
+     * modified "lzma alone" file format, that was used by the `lzma` utility
+     * which was later deprecated in favour of `xz` utility. Since those
+     * formats are nearly the same, we can use a standard "lzma alone" decoder
+     * from XZ Utils. */
+
+    memset(&zip->zipx_lzma_stream, 0, sizeof(zip->zipx_lzma_stream));
+    r = lzma_alone_decoder(&zip->zipx_lzma_stream, UINT64_MAX);
+    if (r != LZMA_OK) {
+        archive_set_error(&(a->archive),
+            ARCHIVE_ERRNO_MISC,
+            "LZMA initialization failed(%d)",
+            r);
+
+        return (ARCHIVE_FAILED);
+    }
+
+    /* The "lzma alone" file format and the stream format inside ZIPx are
+     * *almost* the same. Here's an example of a structure of "lzma alone"
+     * format:
+     *
+     * $ cat /bin/ls | lzma | xxd | head -n 1
+     * 00000000: 5d00 0080 00ff ffff ffff ffff ff00 2814
+     *
+     *    5 bytes        8 bytes        n bytes
+     * <lzma_params><uncompressed_size><data...>
+     *
+     * lzma_params is a 5-byte blob that has to be decoded to extract
+     * parameters of this LZMA stream. The uncompressed_size field is an
+     * uint64_t value that contains information about the size of the
+     * uncompressed file, or UINT64_MAX if this value is unknown. The <data...>
+     * part is the actual lzma-compressed data stream.
+     *
+     * Now here's the structure of the stream inside the ZIPX file:
+     *
+     * $ cat stream_inside_zipx | xxd | head -n 1
+     * 00000000: 0914 0500 5d00 8000 0000 2814 .... ....
+     *
+     *  2byte   2byte    5 bytes     n bytes
+     * <magic1><magic2><lzma_params><data...>
+     *
+     * This means that the ZIPX file contains an additional magic1 and magic2
+     * headers, the lzma_params field contains the same parameter set as in the
+     * "lzma alone" format, and the <data...> field is the same as in the "lzma
+     * alone" format as well. Note that also the zipx format is missing the 
+     * uncompressed_size field.
+     *
+     * So, in order to use the "lzma alone" decoder for the zipx lzma stream,
+     * we simply need to shuffle around some fields, prepare a new lzma alone
+     * header, feed it into lzma alone decoder so it will initialize itself
+     * properly, and then we can start feeding normal zipx lzma stream into the
+     * decoder.
+     */
+
+    /* Read magic1,magic2,lzma_params from the ZIPX stream. */
+    if ((p = __archive_read_ahead(a, 9, NULL)) == NULL) {
+        archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+            "Truncated ZIPX data");
+        return (ARCHIVE_FATAL);
+    }
+
+    // TODO: check magic ".... 0500 ...."
+    
+    /* Prepare a lzma alone header: copy the lzma_params blob into a proper
+     * place into the lzma alone header. */
+    memcpy(&alone_header.bytes[0], p + 4, 5);
+
+    /* Initialize the 'uncompressed size' field to unknown; we'll manually 
+     * monitor how many bytes there are still to be uncompressed. */
+    alone_header.uncompressed_size = UINT64_MAX;
+
+    zip->zipx_uncompressed_buffer_size = 256 * 1024;
+    zip->zipx_uncompressed_buffer = 
+        (uint8_t*) malloc(zip->zipx_uncompressed_buffer_size);
+    if (zip->zipx_uncompressed_buffer == NULL) {
+        archive_set_error(&a->archive, ENOMEM,
+            "No memory for ZIPX decompression");
+        return (ARCHIVE_FATAL);
+    }
+
+    zip->zipx_lzma_stream.next_in = (void*) &alone_header;
+    zip->zipx_lzma_stream.avail_in = sizeof(alone_header);
+    zip->zipx_lzma_stream.total_in = 0;
+    zip->zipx_lzma_stream.next_out = zip->zipx_uncompressed_buffer;
+    zip->zipx_lzma_stream.avail_out = zip->zipx_uncompressed_buffer_size;
+    zip->zipx_lzma_stream.total_out = 0;
+
+    /* Feed only the header into the lzma alone decoder. This will effectively
+     * initialize the decoder, and will not produce any output bytes yet. */
+    r = lzma_code(&zip->zipx_lzma_stream, LZMA_RUN);
+    if (r != LZMA_OK) {
+        archive_set_error(&a->archive, ARCHIVE_ERRNO_PROGRAMMER,
+                "ZIPX LZMA stream initialization error");
+        return ARCHIVE_FATAL;
+    }
+
+    __archive_read_consume(a, 9);
+    zip->decompress_init = 1;
+    return (ARCHIVE_OK);
+}
+
+static int
+consume_optional_marker(struct archive_read *a, struct zip *zip) 
+{
+	if (zip->end_of_entry && (zip->entry->zip_flags & ZIP_LENGTH_AT_END)) {
+		const char *p;
+
+		if (NULL == (p = __archive_read_ahead(a, 24, NULL))) {
+			archive_set_error(&a->archive,
+			    ARCHIVE_ERRNO_FILE_FORMAT,
+			    "Truncated ZIP end-of-file record");
+			return (ARCHIVE_FATAL);
+		}
+		/* Consume the optional PK\007\010 marker. */
+		if (p[0] == 'P' && p[1] == 'K' &&
+		    p[2] == '\007' && p[3] == '\010') {
+			p += 4;
+			zip->unconsumed = 4;
+		}
+		if (zip->entry->flags & LA_USED_ZIP64) {
+			uint64_t compressed, uncompressed;
+			zip->entry->crc32 = archive_le32dec(p);
+			compressed = archive_le64dec(p + 4);
+			uncompressed = archive_le64dec(p + 12);
+			if (compressed > INT64_MAX || uncompressed > INT64_MAX) {
+				archive_set_error(&a->archive,
+				    ARCHIVE_ERRNO_FILE_FORMAT,
+				    "Overflow of 64-bit file sizes");
+				return ARCHIVE_FAILED;
+			}
+			zip->entry->compressed_size = compressed;
+			zip->entry->uncompressed_size = uncompressed;
+			zip->unconsumed += 20;
+		} else {
+			zip->entry->crc32 = archive_le32dec(p);
+			zip->entry->compressed_size = archive_le32dec(p + 4);
+			zip->entry->uncompressed_size = archive_le32dec(p + 8);
+			zip->unconsumed += 12;
+		}
+	}
+
+    return (ARCHIVE_OK);
+}
+
+static int
+zip_read_data_zipx_lzma_alone(struct archive_read *a, const void **buff,
+    size_t *size, int64_t *offset)
+{
+    struct zip* zip = (struct zip *)(a->format->data);
+    int ret;
+    lzma_ret lz_ret;
+    const void* compressed_buf;
+    ssize_t bytes_avail, in_bytes, to_consume;
+
+    (void) offset; /* UNUSED */
+
+    /* Initialize decompressor if not yet initialized. */
+    if (!zip->decompress_init) {
+        ret = zipx_lzma_alone_init(a, zip);
+        if (ret != ARCHIVE_OK)
+            return (ret);
+    }
+
+    /* Fetch more compressed data. The same note as in deflate handler applies
+     * here as well:
+     *
+     * Note: '1' here is a performance optimization. Recall that the
+     * decompression layer returns a count of available bytes; asking for more
+     * than that forces the decompressor to combine reads by copying data.
+     */
+    compressed_buf = __archive_read_ahead(a, 1, &bytes_avail);
+    if (bytes_avail < 0) {
+		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+		    "Truncated ZIP file body");
+		return (ARCHIVE_FATAL);
+    }
+
+    /* Set decompressor parameters. */
+    in_bytes = ZIPX_MIN(zip->entry_bytes_remaining, bytes_avail);
+    zip->zipx_lzma_stream.next_in = compressed_buf;
+    zip->zipx_lzma_stream.avail_in = in_bytes;
+    zip->zipx_lzma_stream.total_in = 0;
+    zip->zipx_lzma_stream.next_out = zip->zipx_uncompressed_buffer;
+    zip->zipx_lzma_stream.avail_out = zip->zipx_uncompressed_buffer_size;
+    zip->zipx_lzma_stream.total_out = 0;
+
+    /* Perform the decompression. */
+    lz_ret = lzma_code(&zip->zipx_lzma_stream, LZMA_RUN);
+    switch(lz_ret) {
+        case LZMA_DATA_ERROR:
+            archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+                "ZIPX LZMA data error (error %d)", (int) lz_ret);
+            return (ARCHIVE_FATAL);
+
+        case LZMA_OK:
+            break;
+
+        default:
+            archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+                "ZIPX LZMA unknown error %d", (int) lz_ret);
+            return (ARCHIVE_FATAL);
+    }
+
+    to_consume = zip->zipx_lzma_stream.total_in;
+
+    /* Update pointers. */
+    __archive_read_consume(a, to_consume);
+    zip->entry_bytes_remaining -= to_consume;
+    zip->entry_compressed_bytes_read += to_consume;
+    zip->entry_uncompressed_bytes_read += zip->zipx_lzma_stream.total_out;
+
+    /* Return values. */
+    *size = zip->zipx_lzma_stream.total_out;
+    *buff = zip->zipx_uncompressed_buffer;
+
+    /* Behave the same way as during deflate decompression. */
+    ret = consume_optional_marker(a, zip);
+    if (ret != ARCHIVE_OK)
+        return (ret);
+
+    /* If we're here, then we're good! */
+    return (ARCHIVE_OK);
+}
+
+static int
+zip_read_data_zipx_ppmd(struct archive_read *a, const void **buff,
+    size_t *size, int64_t *offset)
+{
+	int i;
+	struct zip* zip = (struct zip *)(a->format->data);
+
+	(void) a;
+	(void) buff;
+	(void) size;
+	(void) offset;
+
+	const uint8_t* p = __archive_read_ahead(a, 16, NULL);
+	for(i = 0; i < 16; i++) {
+		printf("%02x ", p[i]);
+	}
+
+	printf("\ntrying to decompress %ld bytes...\n", zip->entry_bytes_remaining);
+	return ARCHIVE_FATAL;
+}
+
 #ifdef HAVE_ZLIB_H
 static int
 zip_deflate_init(struct archive_read *a, struct zip *zip)
@@ -1470,44 +1743,11 @@ zip_read_data_deflate(struct archive_read *a, const void **buff,
 			return (r);
 	}
 
-	if (zip->end_of_entry && (zip->entry->zip_flags & ZIP_LENGTH_AT_END)) {
-		const char *p;
+    r = consume_optional_marker(a, zip);
+    if (r != ARCHIVE_OK)
+        return (r);
 
-		if (NULL == (p = __archive_read_ahead(a, 24, NULL))) {
-			archive_set_error(&a->archive,
-			    ARCHIVE_ERRNO_FILE_FORMAT,
-			    "Truncated ZIP end-of-file record");
-			return (ARCHIVE_FATAL);
-		}
-		/* Consume the optional PK\007\010 marker. */
-		if (p[0] == 'P' && p[1] == 'K' &&
-		    p[2] == '\007' && p[3] == '\010') {
-			p += 4;
-			zip->unconsumed = 4;
-		}
-		if (zip->entry->flags & LA_USED_ZIP64) {
-			uint64_t compressed, uncompressed;
-			zip->entry->crc32 = archive_le32dec(p);
-			compressed = archive_le64dec(p + 4);
-			uncompressed = archive_le64dec(p + 12);
-			if (compressed > INT64_MAX || uncompressed > INT64_MAX) {
-				archive_set_error(&a->archive,
-				    ARCHIVE_ERRNO_FILE_FORMAT,
-				    "Overflow of 64-bit file sizes");
-				return ARCHIVE_FAILED;
-			}
-			zip->entry->compressed_size = compressed;
-			zip->entry->uncompressed_size = uncompressed;
-			zip->unconsumed += 20;
-		} else {
-			zip->entry->crc32 = archive_le32dec(p);
-			zip->entry->compressed_size = archive_le32dec(p + 4);
-			zip->entry->uncompressed_size = archive_le32dec(p + 8);
-			zip->unconsumed += 12;
-		}
-	}
-
-	return (ARCHIVE_OK);
+    return (ARCHIVE_OK);
 }
 #endif
 
@@ -1932,6 +2172,12 @@ archive_read_format_zip_read_data(struct archive_read *a,
 	switch(zip->entry->compression) {
 	case 0:  /* No compression. */
 		r =  zip_read_data_none(a, buff, size, offset);
+		break;
+	case 14: /* ZIPx LZMA */
+		r = zip_read_data_zipx_lzma_alone(a, buff, size, offset);
+		break;
+	case 98: /* ZIPx PPMd */
+		r = zip_read_data_zipx_ppmd(a, buff, size, offset);
 		break;
 #ifdef HAVE_ZLIB_H
 	case 8: /* Deflate compression. */
