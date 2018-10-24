@@ -158,6 +158,8 @@ struct trad_enc_ctx {
 /**/
 #define MAX_DERIVED_KEY_BUF_SIZE	(AES_MAX_KEY_SIZE * 2 + 2)
 
+#define ZIPX_MIN(a, b) (((a) > (b)) ? (b) : (a))
+
 struct zip {
 	/* Structural information about the archive. */
 	struct archive_string	format_name;
@@ -1363,8 +1365,8 @@ consume_optional_marker(struct archive_read *a, struct zip *zip)
 
 		if (NULL == (p = __archive_read_ahead(a, 24, NULL))) {
 			archive_set_error(&a->archive,
-				ARCHIVE_ERRNO_FILE_FORMAT,
-				"Truncated ZIP end-of-file record");
+			    ARCHIVE_ERRNO_FILE_FORMAT,
+			    "Truncated ZIP end-of-file record");
 			return (ARCHIVE_FATAL);
 		}
 		/* Consume the optional PK\007\010 marker. */

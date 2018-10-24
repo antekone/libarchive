@@ -3260,11 +3260,7 @@ test_summarize(int failed, int skips_num)
 static int
 test_run(int i, const char *tmpdir)
 {
-#ifdef PATH_MAX
-	char workdir[PATH_MAX];
-#else
-	char workdir[1024];
-#endif
+	char workdir[8192];
 	char logfilename[64];
 	int failures_before = failures;
 	int skips_before = skips;

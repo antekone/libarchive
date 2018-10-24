@@ -34,7 +34,7 @@ DEFINE_TEST(test_option_t)
 	char *p;
 	int r;
 	time_t mtime;
-	char date[32];
+	char date[64];
 	char date2[32];
 
 	/* List reference archive, make sure the TOC is correct. */
