@@ -1857,6 +1857,7 @@ zipx_bzip2_init(struct archive_read *a, struct zip *zip)
 
 		return ARCHIVE_FAILED;
 	}
+	__archive_read_consume(a, 2);
 
 	if(zip->uncompressed_buffer)
 		free(zip->uncompressed_buffer);
