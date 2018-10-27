@@ -68,6 +68,7 @@ __FBSDID("$FreeBSD: head/lib/libarchive/archive_read_support_format_zip.c 201102
 #include "archive_private.h"
 #include "archive_rb.h"
 #include "archive_read_private.h"
+#include "archive_ppmd8_private.h"
 
 #ifndef HAVE_ZLIB_H
 #include "archive_crc32.h"
@@ -185,6 +186,8 @@ struct zip {
     lzma_stream     zipx_lzma_stream;
 #endif
 
+	IByteIn zipx_ppmd_stream;
+
 	struct archive_string_conv *sconv;
 	struct archive_string_conv *sconv_default;
 	struct archive_string_conv *sconv_utf8;
@@ -234,6 +237,19 @@ struct zip {
 
 /* Many systems define min or MIN, but not all. */
 #define	zipmin(a,b) ((a) < (b) ? (a) : (b))
+
+static uint16_t 
+get_u16(const uint8_t* p) {
+	return *(const uint16_t*)p;
+}
+
+static Byte
+ppmd_read(void* p) {
+	struct archive_read *a = ((IByteIn*)p)->a;
+	const uint8_t* data = __archive_read_ahead(a, 1, NULL);
+	__archive_read_consume(a, 1);
+	return data[0];
+}
 
 /* ------------------------------------------------------------------------ */
 
@@ -1381,7 +1397,7 @@ zipx_lzma_alone_init(struct archive_read *a, struct zip *zip)
     /* Read magic1,magic2,lzma_params from the ZIPX stream. */
     if ((p = __archive_read_ahead(a, 9, NULL)) == NULL) {
         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
-            "Truncated ZIPX data");
+            "Truncated ZIPx data");
         return (ARCHIVE_FATAL);
     }
 
@@ -1400,7 +1416,7 @@ zipx_lzma_alone_init(struct archive_read *a, struct zip *zip)
         (uint8_t*) malloc(zip->zipx_uncompressed_buffer_size);
     if (zip->zipx_uncompressed_buffer == NULL) {
         archive_set_error(&a->archive, ENOMEM,
-            "No memory for ZIPX decompression");
+            "No memory for ZIPx decompression");
         return (ARCHIVE_FATAL);
     }
 
@@ -1416,7 +1432,7 @@ zipx_lzma_alone_init(struct archive_read *a, struct zip *zip)
     r = lzma_code(&zip->zipx_lzma_stream, LZMA_RUN);
     if (r != LZMA_OK) {
         archive_set_error(&a->archive, ARCHIVE_ERRNO_PROGRAMMER,
-                "ZIPX LZMA stream initialization error");
+                "ZIPx LZMA stream initialization error");
         return ARCHIVE_FATAL;
     }
 
@@ -1515,7 +1531,7 @@ zip_read_data_zipx_lzma_alone(struct archive_read *a, const void **buff,
     switch(lz_ret) {
         case LZMA_DATA_ERROR:
             archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
-                "ZIPX LZMA data error (error %d)", (int) lz_ret);
+                "ZIPx LZMA data error (error %d)", (int) lz_ret);
             return (ARCHIVE_FATAL);
 
         case LZMA_OK:
@@ -1523,7 +1539,7 @@ zip_read_data_zipx_lzma_alone(struct archive_read *a, const void **buff,
 
         default:
             archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
-                "ZIPX LZMA unknown error %d", (int) lz_ret);
+                "ZIPx LZMA unknown error %d", (int) lz_ret);
             return (ARCHIVE_FATAL);
     }
 
@@ -1553,19 +1569,64 @@ zip_read_data_zipx_ppmd(struct archive_read *a, const void **buff,
     size_t *size, int64_t *offset)
 {
 	int i;
+	const uint8_t* p;
 	struct zip* zip = (struct zip *)(a->format->data);
+	CPpmd8 ppmd;
 
 	(void) a;
 	(void) buff;
 	(void) size;
 	(void) offset;
+	(void) ppmd;
 
-	const uint8_t* p = __archive_read_ahead(a, 16, NULL);
+	LOG("ppmd init");
+	__archive_ppmd8_functions.Ppmd8_Construct(&ppmd);
+
+	ppmd.Stream.In = &zip->zipx_ppmd_stream;
+	zip->zipx_ppmd_stream.a = a;
+	zip->zipx_ppmd_stream.Read = &ppmd_read;
+
+	p = __archive_read_ahead(a, 2, NULL);
 	for(i = 0; i < 16; i++) {
 		printf("%02x ", p[i]);
 	}
+	__archive_read_consume(a, 2);
 
 	printf("\ntrying to decompress %ld bytes...\n", zip->entry_bytes_remaining);
+
+	uint32_t val = get_u16(p);
+	uint32_t order = (val & 15) + 1;
+	uint32_t mem = ((val >> 4) & 0xff) + 1;
+	uint32_t restore_method = (val >> 12);
+
+	if(order < 2 || restore_method > 2) {
+		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+		    "Invalid parameter set in ZIPx PPMd stream (order=%d, "
+			"restore=%d)", order, restore_method);
+		return (ARCHIVE_FAILED);
+	}
+
+	if(!__archive_ppmd8_functions.Ppmd8_Alloc(&ppmd, mem << 20)) {
+		archive_set_error(&a->archive, ENOMEM,
+			"Unable to allocate memory for ZIPx PPMd stream: %d bytes", 
+			mem << 20);
+		return (ARCHIVE_FATAL);
+	}
+
+	if(!__archive_ppmd8_functions.Ppmd8_RangeDec_Init(&ppmd)) {
+        archive_set_error(&a->archive, ARCHIVE_ERRNO_PROGRAMMER,
+			"ZIPx PPMd stream range decoder initialization error");
+        return ARCHIVE_FATAL;
+	}
+
+	__archive_ppmd8_functions.Ppmd8_Init(&ppmd, order, restore_method);
+	LOG("OK");
+
+	int sym = __archive_ppmd8_functions.Ppmd8_DecodeSymbol(&ppmd);
+	LOG("sym=0x%08x", sym);
+	sym = __archive_ppmd8_functions.Ppmd8_DecodeSymbol(&ppmd);
+	LOG("sym=0x%08x", sym);
+
 	return ARCHIVE_FATAL;
 }
 
