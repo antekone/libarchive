@@ -45,6 +45,24 @@ __FBSDID("$FreeBSD: head/lib/libarchive/archive_read_support_format_zip.c 201102
  */
 
 #define LOG(...) do { printf(__VA_ARGS__); puts(""); } while(0)
+#define HEXDUMP(what, size) do {\
+        size_t __i = 0;\
+        uint8_t* __x = (uint8_t*) &what;\
+        for(__i = 0; __i < (size_t) size; __i++) {\
+            printf("%02x ", __x[__i]);\
+        }\
+        \
+        printf("\n");\
+    } while(0)
+#define HEXDUMP_PTR(what, size) do {\
+        size_t __i = 0;\
+        const uint8_t* __x = (const uint8_t*) what;\
+        for(__i = 0; __i < (size_t) size; __i++) {\
+            printf("%02x ", __x[__i]);\
+        }\
+        \
+        printf("\n");\
+    } while(0)
 #ifdef HAVE_ERRNO_H
 #include <errno.h>
 #endif
@@ -173,20 +191,21 @@ struct zip {
 	char			decompress_init;
 	char			end_of_entry;
 
-#ifdef HAVE_ZLIB_H
 	unsigned char 		*uncompressed_buffer;
 	size_t 			uncompressed_buffer_size;
+
+#ifdef HAVE_ZLIB_H
 	z_stream		stream;
 	char			stream_valid;
 #endif
 
 #ifdef HAVE_LZMA_H
-    uint8_t         *zipx_uncompressed_buffer;
-    size_t          zipx_uncompressed_buffer_size;
     lzma_stream     zipx_lzma_stream;
 #endif
 
 	IByteIn zipx_ppmd_stream;
+    ssize_t zipx_ppmd_read_compressed;
+    CPpmd8 ppmd8;
 
 	struct archive_string_conv *sconv;
 	struct archive_string_conv *sconv_default;
@@ -246,8 +265,12 @@ get_u16(const uint8_t* p) {
 static Byte
 ppmd_read(void* p) {
 	struct archive_read *a = ((IByteIn*)p)->a;
+    struct zip *zip = (struct zip*) a->format->data;
 	const uint8_t* data = __archive_read_ahead(a, 1, NULL);
 	__archive_read_consume(a, 1);
+
+    ++zip->zipx_ppmd_read_compressed;
+
 	return data[0];
 }
 
@@ -401,6 +424,8 @@ static const struct {
 	{17, "reserved"}, /* Reserved by PKWARE */
 	{18, "ibm-terse-new"}, /* File is compressed using IBM TERSE (new) */
 	{19, "ibm-lz777"},/* IBM LZ77 z Architecture (PFS) */
+    {95, "xz"},       /* XZ compressed data */
+    {96, "jpeg"},     /* JPEG compressed data */
 	{97, "wav-pack"}, /* WavPack compressed data */
 	{98, "ppmd-1"},   /* PPMd version I, Rev 1 */
 	{99, "aes"}       /* WinZip AES encryption  */
@@ -1326,6 +1351,36 @@ zip_read_data_none(struct archive_read *a, const void **_buff,
 }
 
 static int
+zipx_xz_init(struct archive_read *a, struct zip *zip)
+{
+    lzma_ret r;
+
+    memset(&zip->zipx_lzma_stream, 0, sizeof(zip->zipx_lzma_stream));
+    r = lzma_stream_decoder(&zip->zipx_lzma_stream, UINT64_MAX, LZMA_TELL_NO_CHECK);
+    if (r != LZMA_OK) {
+        archive_set_error(&(a->archive),
+            ARCHIVE_ERRNO_MISC,
+            "XZ initialization failed(%d)",
+            r);
+
+        return (ARCHIVE_FAILED);
+    }
+
+    if(!zip->uncompressed_buffer) {
+        zip->uncompressed_buffer_size = 256 * 1024;
+        zip->uncompressed_buffer = 
+            (uint8_t*) malloc(zip->uncompressed_buffer_size);
+        if (zip->uncompressed_buffer == NULL) {
+            archive_set_error(&a->archive, ENOMEM,
+                "No memory for ZIPx decompression");
+            return (ARCHIVE_FATAL);
+        }
+    }
+
+    zip->decompress_init = 1;
+    return (ARCHIVE_OK);
+}
+static int
 zipx_lzma_alone_init(struct archive_read *a, struct zip *zip)
 {
     lzma_ret r;
@@ -1401,6 +1456,8 @@ zipx_lzma_alone_init(struct archive_read *a, struct zip *zip)
         return (ARCHIVE_FATAL);
     }
 
+    /*HEXDUMP_PTR(p, 9);*/
+
     // TODO: check magic ".... 0500 ...."
     
     /* Prepare a lzma alone header: copy the lzma_params blob into a proper
@@ -1411,21 +1468,27 @@ zipx_lzma_alone_init(struct archive_read *a, struct zip *zip)
      * monitor how many bytes there are still to be uncompressed. */
     alone_header.uncompressed_size = UINT64_MAX;
 
-    zip->zipx_uncompressed_buffer_size = 256 * 1024;
-    zip->zipx_uncompressed_buffer = 
-        (uint8_t*) malloc(zip->zipx_uncompressed_buffer_size);
-    if (zip->zipx_uncompressed_buffer == NULL) {
-        archive_set_error(&a->archive, ENOMEM,
-            "No memory for ZIPx decompression");
-        return (ARCHIVE_FATAL);
+    /* TODO: free zipx_uncompressed_buffer */
+
+    if(!zip->uncompressed_buffer) {
+        zip->uncompressed_buffer_size = 256 * 1024;
+        zip->uncompressed_buffer = 
+            (uint8_t*) malloc(zip->uncompressed_buffer_size);
+        if (zip->uncompressed_buffer == NULL) {
+            archive_set_error(&a->archive, ENOMEM,
+                "No memory for ZIPx decompression");
+            return (ARCHIVE_FATAL);
+        }
     }
 
     zip->zipx_lzma_stream.next_in = (void*) &alone_header;
     zip->zipx_lzma_stream.avail_in = sizeof(alone_header);
     zip->zipx_lzma_stream.total_in = 0;
-    zip->zipx_lzma_stream.next_out = zip->zipx_uncompressed_buffer;
-    zip->zipx_lzma_stream.avail_out = zip->zipx_uncompressed_buffer_size;
+    zip->zipx_lzma_stream.next_out = zip->uncompressed_buffer;
+    zip->zipx_lzma_stream.avail_out = zip->uncompressed_buffer_size;
     zip->zipx_lzma_stream.total_out = 0;
+
+    /*HEXDUMP(alone_header, sizeof(alone_header));*/
 
     /* Feed only the header into the lzma alone decoder. This will effectively
      * initialize the decoder, and will not produce any output bytes yet. */
@@ -1438,6 +1501,9 @@ zipx_lzma_alone_init(struct archive_read *a, struct zip *zip)
 
     __archive_read_consume(a, 9);
     zip->decompress_init = 1;
+    
+    /* We've already consumed some bytes, so take this into account. */
+    zip->entry_bytes_remaining -= 9;
     return (ARCHIVE_OK);
 }
 
@@ -1485,6 +1551,87 @@ consume_optional_marker(struct archive_read *a, struct zip *zip)
 }
 
 static int
+zip_read_data_zipx_xz(struct archive_read *a, const void **buff,
+    size_t *size, int64_t *offset)
+{
+    struct zip* zip = (struct zip *)(a->format->data);
+    int ret;
+    lzma_ret lz_ret;
+    const void* compressed_buf;
+    ssize_t bytes_avail, in_bytes, to_consume = 0;
+
+    (void) offset; /* UNUSED */
+
+    /* Initialize decompressor if not yet initialized. */
+    if (!zip->decompress_init) {
+        ret = zipx_xz_init(a, zip);
+        if (ret != ARCHIVE_OK)
+            return (ret);
+    }
+
+    compressed_buf = __archive_read_ahead(a, 1, &bytes_avail);
+    if (bytes_avail < 0) {
+		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+		    "Truncated ZIPx file body");
+		return (ARCHIVE_FATAL);
+    }
+
+    in_bytes = ZIPX_MIN(zip->entry_bytes_remaining, bytes_avail);
+    zip->zipx_lzma_stream.next_in = compressed_buf;
+    zip->zipx_lzma_stream.avail_in = in_bytes;
+    zip->zipx_lzma_stream.total_in = 0;
+    zip->zipx_lzma_stream.next_out = zip->uncompressed_buffer;
+    zip->zipx_lzma_stream.avail_out = zip->uncompressed_buffer_size;
+    zip->zipx_lzma_stream.total_out = 0;
+
+    /*HEXDUMP_PTR(compressed_buf, in_bytes);*/
+
+    /* Perform the decompression. */
+    lz_ret = lzma_code(&zip->zipx_lzma_stream, LZMA_RUN);
+    switch(lz_ret) {
+        case LZMA_DATA_ERROR:
+            archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+                "ZIPx LZMA data error (error %d)", (int) lz_ret);
+            return (ARCHIVE_FATAL);
+
+        case LZMA_NO_CHECK:
+        case LZMA_OK:
+            break;
+
+        default:
+            archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+                "ZIPx LZMA unknown error %d", (int) lz_ret);
+            return (ARCHIVE_FATAL);
+
+        case LZMA_STREAM_END:
+            if((int64_t) zip->zipx_lzma_stream.total_in !=
+                    zip->entry_bytes_remaining)
+            {
+                archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+                    "ZIPx LZMA premature end of stream");
+                return (ARCHIVE_FATAL);
+            }
+            break;
+    }
+
+    to_consume = zip->zipx_lzma_stream.total_in;
+
+    __archive_read_consume(a, to_consume);
+    zip->entry_bytes_remaining -= to_consume;
+    zip->entry_compressed_bytes_read += to_consume;
+    zip->entry_uncompressed_bytes_read += zip->zipx_lzma_stream.total_out;
+
+    *size = zip->zipx_lzma_stream.total_out;
+    *buff = zip->uncompressed_buffer;
+
+    ret = consume_optional_marker(a, zip);
+    if (ret != ARCHIVE_OK)
+        return (ret);
+
+    return (ARCHIVE_OK);
+}
+
+static int
 zip_read_data_zipx_lzma_alone(struct archive_read *a, const void **buff,
     size_t *size, int64_t *offset)
 {
@@ -1513,7 +1660,7 @@ zip_read_data_zipx_lzma_alone(struct archive_read *a, const void **buff,
     compressed_buf = __archive_read_ahead(a, 1, &bytes_avail);
     if (bytes_avail < 0) {
 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
-		    "Truncated ZIP file body");
+		    "Truncated ZIPx file body");
 		return (ARCHIVE_FATAL);
     }
 
@@ -1522,9 +1669,11 @@ zip_read_data_zipx_lzma_alone(struct archive_read *a, const void **buff,
     zip->zipx_lzma_stream.next_in = compressed_buf;
     zip->zipx_lzma_stream.avail_in = in_bytes;
     zip->zipx_lzma_stream.total_in = 0;
-    zip->zipx_lzma_stream.next_out = zip->zipx_uncompressed_buffer;
-    zip->zipx_lzma_stream.avail_out = zip->zipx_uncompressed_buffer_size;
+    zip->zipx_lzma_stream.next_out = zip->uncompressed_buffer;
+    zip->zipx_lzma_stream.avail_out = zip->uncompressed_buffer_size;
     zip->zipx_lzma_stream.total_out = 0;
+
+    /*HEXDUMP_PTR(compressed_buf, in_bytes);*/
 
     /* Perform the decompression. */
     lz_ret = lzma_code(&zip->zipx_lzma_stream, LZMA_RUN);
@@ -1553,7 +1702,7 @@ zip_read_data_zipx_lzma_alone(struct archive_read *a, const void **buff,
 
     /* Return values. */
     *size = zip->zipx_lzma_stream.total_out;
-    *buff = zip->zipx_uncompressed_buffer;
+    *buff = zip->uncompressed_buffer;
 
     /* Behave the same way as during deflate decompression. */
     ret = consume_optional_marker(a, zip);
@@ -1565,39 +1714,32 @@ zip_read_data_zipx_lzma_alone(struct archive_read *a, const void **buff,
 }
 
 static int
-zip_read_data_zipx_ppmd(struct archive_read *a, const void **buff,
-    size_t *size, int64_t *offset)
+zipx_ppmd8_init(struct archive_read *a, struct zip *zip)
 {
-	int i;
-	const uint8_t* p;
-	struct zip* zip = (struct zip *)(a->format->data);
-	CPpmd8 ppmd;
+    const void* p;
+    uint32_t val;
+    uint32_t order;
+    uint32_t mem;
+    uint32_t restore_method;
 
-	(void) a;
-	(void) buff;
-	(void) size;
-	(void) offset;
-	(void) ppmd;
+	__archive_ppmd8_functions.Ppmd8_Construct(&zip->ppmd8);
 
-	LOG("ppmd init");
-	__archive_ppmd8_functions.Ppmd8_Construct(&ppmd);
+    zip->ppmd8.Stream.In = &zip->zipx_ppmd_stream;
+    zip->zipx_ppmd_stream.a = a;
+    zip->zipx_ppmd_stream.Read = &ppmd_read;
 
-	ppmd.Stream.In = &zip->zipx_ppmd_stream;
-	zip->zipx_ppmd_stream.a = a;
-	zip->zipx_ppmd_stream.Read = &ppmd_read;
+    p = __archive_read_ahead(a, 2, NULL);
+    if(!p) {
+        archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+            "Truncated ZIPx file data in PPMd stream");
+        return (ARCHIVE_FATAL);
+    }
+    __archive_read_consume(a, 2);
 
-	p = __archive_read_ahead(a, 2, NULL);
-	for(i = 0; i < 16; i++) {
-		printf("%02x ", p[i]);
-	}
-	__archive_read_consume(a, 2);
-
-	printf("\ntrying to decompress %ld bytes...\n", zip->entry_bytes_remaining);
-
-	uint32_t val = get_u16(p);
-	uint32_t order = (val & 15) + 1;
-	uint32_t mem = ((val >> 4) & 0xff) + 1;
-	uint32_t restore_method = (val >> 12);
+	val = get_u16(p);
+	order = (val & 15) + 1;
+	mem = ((val >> 4) & 0xff) + 1;
+	restore_method = (val >> 12);
 
 	if(order < 2 || restore_method > 2) {
 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
@@ -1606,28 +1748,84 @@ zip_read_data_zipx_ppmd(struct archive_read *a, const void **buff,
 		return (ARCHIVE_FAILED);
 	}
 
-	if(!__archive_ppmd8_functions.Ppmd8_Alloc(&ppmd, mem << 20)) {
+	if(!__archive_ppmd8_functions.Ppmd8_Alloc(&zip->ppmd8, mem << 20)) {
 		archive_set_error(&a->archive, ENOMEM,
 			"Unable to allocate memory for ZIPx PPMd stream: %d bytes", 
 			mem << 20);
 		return (ARCHIVE_FATAL);
 	}
 
-	if(!__archive_ppmd8_functions.Ppmd8_RangeDec_Init(&ppmd)) {
+	if(!__archive_ppmd8_functions.Ppmd8_RangeDec_Init(&zip->ppmd8)) {
         archive_set_error(&a->archive, ARCHIVE_ERRNO_PROGRAMMER,
 			"ZIPx PPMd stream range decoder initialization error");
-        return ARCHIVE_FATAL;
+        return (ARCHIVE_FATAL);
 	}
 
-	__archive_ppmd8_functions.Ppmd8_Init(&ppmd, order, restore_method);
-	LOG("OK");
+	__archive_ppmd8_functions.Ppmd8_Init(&zip->ppmd8, order, restore_method);
 
-	int sym = __archive_ppmd8_functions.Ppmd8_DecodeSymbol(&ppmd);
-	LOG("sym=0x%08x", sym);
-	sym = __archive_ppmd8_functions.Ppmd8_DecodeSymbol(&ppmd);
-	LOG("sym=0x%08x", sym);
+    if(zip->uncompressed_buffer == NULL) {
+        const int buf_size = 256 * 1024;
+        uint8_t* buf = (uint8_t*) malloc(buf_size);
 
-	return ARCHIVE_FATAL;
+        if(buf == NULL) {
+			archive_set_error(&a->archive, ENOMEM,
+			    "No memory for ZIPx PPMD decompression");
+			return (ARCHIVE_FATAL);
+        }
+
+        zip->uncompressed_buffer_size = buf_size;
+        zip->uncompressed_buffer = (unsigned char*) buf;
+    }
+
+    zip->decompress_init = 1;
+    return ARCHIVE_OK;
+}
+
+static int
+zip_read_data_zipx_ppmd(struct archive_read *a, const void **buff,
+    size_t *size, int64_t *offset)
+{
+	struct zip* zip = (struct zip *)(a->format->data);
+    int ret;
+    size_t consumed_bytes = 0;
+    ssize_t bytes_avail = 0;
+
+	(void) offset; /* NOT USED */
+
+    if(!zip->decompress_init) {
+        ret = zipx_ppmd8_init(a, zip);
+        if(ret != ARCHIVE_OK)
+            return ret;
+    }
+
+    (void) __archive_read_ahead(a, 1, &bytes_avail);
+    if(bytes_avail < 0) {
+		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+		    "Truncated ZIPx file body");
+		return (ARCHIVE_FATAL);
+    }
+
+    /* This counter will be updated inside ppmd_read(), which at one 
+     * point will be called by Ppmd8_DecodeSymbol. */
+    zip->zipx_ppmd_read_compressed = 0;
+
+    do {
+        int sym = __archive_ppmd8_functions.Ppmd8_DecodeSymbol(&zip->ppmd8);
+        if(sym < 0)
+            break;
+
+        zip->uncompressed_buffer[consumed_bytes] = (uint8_t) sym;
+        ++consumed_bytes;
+    } while(consumed_bytes < zip->uncompressed_buffer_size);
+
+    *buff = zip->uncompressed_buffer;
+    *size = consumed_bytes;
+
+    zip->entry_bytes_remaining -= zip->zipx_ppmd_read_compressed;
+    zip->entry_compressed_bytes_read += zip->zipx_ppmd_read_compressed;
+    zip->entry_uncompressed_bytes_read += consumed_bytes;
+
+	return ARCHIVE_OK;
 }
 
 #ifdef HAVE_ZLIB_H
@@ -2230,6 +2428,7 @@ archive_read_format_zip_read_data(struct archive_read *a,
 		zip->init_decryption = 0;
 	}
 
+    LOG("compression: %d", zip->entry->compression);
 	switch(zip->entry->compression) {
 	case 0:  /* No compression. */
 		r =  zip_read_data_none(a, buff, size, offset);
@@ -2237,6 +2436,9 @@ archive_read_format_zip_read_data(struct archive_read *a,
 	case 14: /* ZIPx LZMA */
 		r = zip_read_data_zipx_lzma_alone(a, buff, size, offset);
 		break;
+    case 95: /* ZIPx XZ */
+        r = zip_read_data_zipx_xz(a, buff, size, offset);
+        break;
 	case 98: /* ZIPx PPMd */
 		r = zip_read_data_zipx_ppmd(a, buff, size, offset);
 		break;
@@ -2248,8 +2450,8 @@ archive_read_format_zip_read_data(struct archive_read *a,
 	default: /* Unsupported compression. */
 		/* Return a warning. */
 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
-		    "Unsupported ZIP compression method (%s)",
-		    compression_name(zip->entry->compression));
+		    "Unsupported ZIP compression method (%d: %s)",
+		    zip->entry->compression, compression_name(zip->entry->compression));
 		/* We can't decompress this entry, but we will
 		 * be able to skip() it and try the next entry. */
 		return (ARCHIVE_FAILED);
