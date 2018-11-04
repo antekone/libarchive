@@ -55,6 +55,8 @@ SET(libarchive_SOURCES
   archive_ppmd8_private.h
   archive_ppmd7.c
   archive_ppmd7_private.h
+  archive_inflate64.c
+  archive_inflate64.h
   archive_private.h
   archive_random.c
   archive_random_private.h
