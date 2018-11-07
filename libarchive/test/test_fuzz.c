@@ -373,6 +373,99 @@ DEFINE_TEST(test_fuzz_rar)
 	test_fuzz(filesets);
 }
 
+DEFINE_TEST(test_fuzz_rar5)
+{
+	static const char *fileset1[] = {
+		"test_read_format_rar5_stored.rar",
+		NULL
+	};
+
+	static const char *fileset2[] = {
+		"test_read_format_rar5_compressed.rar",
+		NULL
+	};
+
+    static const char *fileset3[] = {
+        "test_read_format_rar5_multiple_files.rar",
+        NULL
+    };
+
+    static const char *fileset4[] = {
+        "test_read_format_rar5_multiple_files_solid.rar",
+        NULL
+    };
+
+    static const char* fileset5[] = {
+        "test_read_format_rar5_multiarchive.part01.rar",
+        "test_read_format_rar5_multiarchive.part02.rar",
+        "test_read_format_rar5_multiarchive.part03.rar",
+        "test_read_format_rar5_multiarchive.part04.rar",
+        "test_read_format_rar5_multiarchive.part05.rar",
+        "test_read_format_rar5_multiarchive.part06.rar",
+        "test_read_format_rar5_multiarchive.part07.rar",
+        "test_read_format_rar5_multiarchive.part08.rar",
+        NULL
+    };
+
+    static const char* fileset6[] = {
+        "test_read_format_rar5_multiarchive_solid.part01.rar",
+        "test_read_format_rar5_multiarchive_solid.part02.rar",
+        "test_read_format_rar5_multiarchive_solid.part03.rar",
+        "test_read_format_rar5_multiarchive_solid.part04.rar",
+        NULL
+    };
+
+    static const char* fileset7[] = {
+        "test_read_format_rar5_multiarchive_solid.part01.rar",
+        "test_read_format_rar5_multiarchive_solid.part02.rar",
+        "test_read_format_rar5_multiarchive_solid.part03.rar",
+        "test_read_format_rar5_multiarchive_solid.part04.rar",
+        NULL
+    };
+
+    static const char *fileset8[] = {
+        "test_read_format_rar5_blake2.rar",
+        NULL
+    };
+
+    static const char *fileset9[] = {
+        "test_read_format_rar5_arm.rar",
+        NULL
+    };
+
+    static const char *fileset10[] = {
+        "test_read_format_rar5_stored_manyfiles.rar",
+        NULL
+    };
+
+    static const char *fileset11[] = {
+        "test_read_format_rar5_solid.rar",
+        NULL
+    };
+
+    static const char *fileset12[] = {
+        "test_read_format_rar5_win32.rar",
+        NULL
+    };
+
+	static const struct files filesets[] = {
+		{0, fileset1},
+		{0, fileset2},
+		{0, fileset3},
+		{0, fileset4},
+		{0, fileset5},
+		{0, fileset6},
+		{0, fileset7},
+		{0, fileset8},
+		{0, fileset9},
+		{0, fileset10},
+		{0, fileset11},
+		{0, fileset12},
+		{1, NULL}
+	};
+	test_fuzz(filesets);
+}
+
 DEFINE_TEST(test_fuzz_tar)
 {
 	static const char *fileset1[] = {

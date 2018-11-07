@@ -88,6 +88,7 @@ struct file_header {
 
     uint8_t solid : 1;           /* Is this a solid stream? */
     uint8_t service : 1;         /* Is this file a service data? */
+    uint8_t eof : 1;             /* Did we finish unpacking the file? */
 
     /* Optional time fields. */
     uint64_t e_mtime;
@@ -2685,6 +2686,12 @@ static int merge_block(struct archive_read* a, ssize_t block_size,
         cur_block_size =
             rar5_min(rar->file.bytes_remaining, block_size - partial_offset);
 
+        if(cur_block_size == 0) {
+            archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                    "Encountered block size == 0 during block merge");
+            return ARCHIVE_FATAL;
+        }
+
         if(!read_ahead(a, cur_block_size, &lp))
             return ARCHIVE_EOF;
 
@@ -3116,6 +3123,9 @@ static int do_unstore_file(struct archive_read* a,
     }
 
     size_t to_read = rar5_min(rar->file.bytes_remaining, 64 * 1024);
+    if(to_read == 0) {
+        return ARCHIVE_EOF;
+    }
 
     if(!read_ahead(a, to_read, &p)) {
         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT, "I/O error "
@@ -3283,8 +3293,13 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
     }
 
     ret = use_data(rar, buff, size, offset);
-    if(ret == ARCHIVE_OK)
+    if(ret == ARCHIVE_OK) {
         return ret;
+    }
+
+    if(rar->file.eof == 1) {
+        return ARCHIVE_EOF;
+    }
 
     ret = do_unpack(a, rar, buff, size, offset);
     if(ret != ARCHIVE_OK) {
@@ -3301,6 +3316,7 @@ static int rar5_read_data(struct archive_read *a, const void **buff,
          * value in the last `archive_read_data` call to signal an error
          * to the user. */
 
+        rar->file.eof = 1;
         return verify_global_checksums(a);
     }
 
