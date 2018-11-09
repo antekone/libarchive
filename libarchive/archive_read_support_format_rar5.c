@@ -919,7 +919,7 @@ static int read_var_sized(struct archive_read* a, size_t* pvalue,
         size_t* pvalue_len)
 {
     uint64_t v;
-    uint64_t v_size;
+    uint64_t v_size = 0;
 
     const int ret = pvalue_len
                     ? read_var(a, &v, &v_size)
@@ -1219,7 +1219,7 @@ static int process_head_file_extra(struct archive_read* a,
         ssize_t extra_data_size)
 {
     size_t extra_field_size;
-    size_t extra_field_id;
+    size_t extra_field_id = 0;
     int ret = ARCHIVE_FATAL;
     size_t var_size;
 
@@ -1289,7 +1289,7 @@ static int process_head_file(struct archive_read* a, struct rar5* rar,
     size_t host_os = 0;
     size_t name_size = 0;
     uint64_t unpacked_size;
-    uint32_t mtime = 0, crc;
+    uint32_t mtime = 0, crc = 0;
     int c_method = 0, c_version = 0, is_dir;
     char name_utf8_buf[2048 * 4];
     const uint8_t* p;
@@ -1648,7 +1648,7 @@ static int process_base_block(struct archive_read* a,
 {
     struct rar5* rar = get_context(a);
     uint32_t hdr_crc, computed_crc;
-    size_t raw_hdr_size, hdr_size_len, hdr_size;
+    size_t raw_hdr_size = 0, hdr_size_len, hdr_size;
     size_t header_id = 0;
     size_t header_flags = 0;
     const uint8_t* p;
