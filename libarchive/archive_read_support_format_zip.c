@@ -1869,7 +1869,6 @@ zipx_bzip2_init(struct archive_read *a, struct zip *zip)
 
 		return ARCHIVE_FAILED;
 	}
-	__archive_read_consume(a, 2);
 
 	if(zip->uncompressed_buffer)
 		free(zip->uncompressed_buffer);
@@ -1897,8 +1896,6 @@ zip_read_data_zipx_bzip2(struct archive_read *a, const void **buff,
 	int r;
 
 	(void) offset; /* UNUSED */
-
-	LOG("read bzip2");
 
 	if(!zip->decompress_init) {
 		r = zipx_bzip2_init(a, zip);
@@ -1931,9 +1928,9 @@ zip_read_data_zipx_bzip2(struct archive_read *a, const void **buff,
 				case BZ_OK:
 					break;
 				default:
-				archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
-					"Failed to clean up bzip2 decompressor");
-				return ARCHIVE_FATAL;
+					archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+						"Failed to clean up bzip2 decompressor");
+					return ARCHIVE_FATAL;
 			}
 
 			zip->end_of_entry = 1;
@@ -3800,4 +3797,4 @@ archive_read_support_format_zip_seekable(struct archive *_a)
 	return (ARCHIVE_OK);
 }
 
-# vim:set noet:
+/*# vim:set noet:*/
