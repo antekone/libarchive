@@ -275,7 +275,6 @@ ppmd_read(void* p) {
 	__archive_read_consume(a, 1);
 
 	++zip->zipx_ppmd_read_compressed;
-
 	return data[0];
 }
 
@@ -1515,8 +1514,6 @@ zipx_lzma_alone_init(struct archive_read *a, struct zip *zip)
 	 * monitor how many bytes there are still to be uncompressed. */
 	alone_header.uncompressed_size = UINT64_MAX;
 
-	/* TODO: free zipx_uncompressed_buffer */
-
 	if(!zip->uncompressed_buffer) {
 		zip->uncompressed_buffer_size = 256 * 1024;
 		zip->uncompressed_buffer = 
@@ -1535,8 +1532,6 @@ zipx_lzma_alone_init(struct archive_read *a, struct zip *zip)
 	zip->zipx_lzma_stream.avail_out = zip->uncompressed_buffer_size;
 	zip->zipx_lzma_stream.total_out = 0;
 
-	/*HEXDUMP(alone_header, sizeof(alone_header));*/
-
 	/* Feed only the header into the lzma alone decoder. This will effectively
 	 * initialize the decoder, and will not produce any output bytes yet. */
 	r = lzma_code(&zip->zipx_lzma_stream, LZMA_RUN);
@@ -1546,11 +1541,12 @@ zipx_lzma_alone_init(struct archive_read *a, struct zip *zip)
 		return ARCHIVE_FATAL;
 	}
 
-	__archive_read_consume(a, 9);
-	zip->decompress_init = 1;
-	
 	/* We've already consumed some bytes, so take this into account. */
+	__archive_read_consume(a, 9);
 	zip->entry_bytes_remaining -= 9;
+	zip->entry_compressed_bytes_read += 9;
+
+	zip->decompress_init = 1;
 	return (ARCHIVE_OK);
 }
 
@@ -1595,7 +1591,7 @@ zip_read_data_zipx_xz(struct archive_read *a, const void **buff,
 	switch(lz_ret) {
 		case LZMA_DATA_ERROR:
 			archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
-				"ZIPx LZMA data error (error %d)", (int) lz_ret);
+				"ZIPx XZ data error (error %d)", (int) lz_ret);
 			return (ARCHIVE_FATAL);
 
 		case LZMA_NO_CHECK:
@@ -1604,7 +1600,7 @@ zip_read_data_zipx_xz(struct archive_read *a, const void **buff,
 
 		default:
 			archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
-				"ZIPx LZMA unknown error %d", (int) lz_ret);
+				"ZIPx XZ unknown error %d", (int) lz_ret);
 			return (ARCHIVE_FATAL);
 
 		case LZMA_STREAM_END:
@@ -1613,9 +1609,11 @@ zip_read_data_zipx_xz(struct archive_read *a, const void **buff,
 					zip->entry_bytes_remaining)
 			{
 				archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
-					"ZIPx LZMA premature end of stream");
+					"ZIPx XZ premature end of stream");
 				return (ARCHIVE_FATAL);
 			}
+
+			zip->end_of_entry = 1;
 			break;
 	}
 
@@ -1676,10 +1674,13 @@ zip_read_data_zipx_lzma_alone(struct archive_read *a, const void **buff,
 	zip->zipx_lzma_stream.avail_in = in_bytes;
 	zip->zipx_lzma_stream.total_in = 0;
 	zip->zipx_lzma_stream.next_out = zip->uncompressed_buffer;
-	zip->zipx_lzma_stream.avail_out = zip->uncompressed_buffer_size;
+	zip->zipx_lzma_stream.avail_out = 
+		/* These lzma_alone streams lack end of stream marker, so let's make
+		 * sure the unpacker won't try to unpack more than it's supposed to. */
+		zipmin((int64_t) zip->uncompressed_buffer_size, 
+		    zip->entry->uncompressed_size - 
+		    zip->entry_uncompressed_bytes_read);
 	zip->zipx_lzma_stream.total_out = 0;
-
-	/*HEXDUMP_PTR(compressed_buf, in_bytes);*/
 
 	/* Perform the decompression. */
 	lz_ret = lzma_code(&zip->zipx_lzma_stream, LZMA_RUN);
@@ -1705,6 +1706,10 @@ zip_read_data_zipx_lzma_alone(struct archive_read *a, const void **buff,
 	zip->entry_bytes_remaining -= to_consume;
 	zip->entry_compressed_bytes_read += to_consume;
 	zip->entry_uncompressed_bytes_read += zip->zipx_lzma_stream.total_out;
+
+	if(zip->entry_bytes_remaining == 0) {
+		zip->end_of_entry = 1;
+	}
 
 	/* Return values. */
 	*size = zip->zipx_lzma_stream.total_out;
@@ -1734,6 +1739,7 @@ zipx_ppmd8_init(struct archive_read *a, struct zip *zip)
 	zip->ppmd8.Stream.In = &zip->zipx_ppmd_stream;
 	zip->zipx_ppmd_stream.a = a;
 	zip->zipx_ppmd_stream.Read = &ppmd_read;
+	zip->zipx_ppmd_read_compressed = 0;
 
 	p = __archive_read_ahead(a, 2, NULL);
 	if(!p) {
@@ -1784,6 +1790,12 @@ zipx_ppmd8_init(struct archive_read *a, struct zip *zip)
 	}
 
 	zip->decompress_init = 1;
+
+	// We've already read 2 bytes in the output stream. Additionally,
+	// Ppmd8 initialization code could read some data as well. So we
+	// are advancing the stream by 2 bytes plus whatever number of
+	// bytes ppmd8 init function used.
+	zip->entry_compressed_bytes_read += 2 + zip->zipx_ppmd_read_compressed;
 	return ARCHIVE_OK;
 }
 
@@ -1817,8 +1829,10 @@ zip_read_data_zipx_ppmd(struct archive_read *a, const void **buff,
 
 	do {
 		int sym = __archive_ppmd8_functions.Ppmd8_DecodeSymbol(&zip->ppmd8);
-		if(sym < 0)
+		if(sym < 0) {
+			zip->end_of_entry = 1;
 			break;
+		}
 
 		zip->uncompressed_buffer[consumed_bytes] = (uint8_t) sym;
 		++consumed_bytes;
@@ -1922,6 +1936,7 @@ zip_read_data_zipx_bzip2(struct archive_read *a, const void **buff,
 				return ARCHIVE_FATAL;
 			}
 
+			zip->end_of_entry = 1;
 			break;
 		case BZ_OK:
 			break;
@@ -2124,11 +2139,11 @@ zip_read_data_deflate(struct archive_read *a, const void **buff,
 			return (r);
 	}
 
-    r = consume_optional_marker(a, zip);
-    if (r != ARCHIVE_OK)
-        return (r);
+	r = consume_optional_marker(a, zip);
+	if (r != ARCHIVE_OK)
+		return (r);
 
-    return (ARCHIVE_OK);
+	return (ARCHIVE_OK);
 }
 #endif
 
@@ -2563,9 +2578,9 @@ archive_read_format_zip_read_data(struct archive_read *a,
 	case 14: /* ZIPx LZMA compression. */
 		r = zip_read_data_zipx_lzma_alone(a, buff, size, offset);
 		break;
-    case 95: /* ZIPx XZ compression. */
-        r = zip_read_data_zipx_xz(a, buff, size, offset);
-        break;
+	case 95: /* ZIPx XZ compression. */
+		r = zip_read_data_zipx_xz(a, buff, size, offset);
+		break;
 #endif
 	/* PPMd support is built-in, so we don't need any #if guards. */
 	case 98: /* ZIPx PPMd compression. */
@@ -3784,3 +3799,5 @@ archive_read_support_format_zip_seekable(struct archive *_a)
 		free(zip);
 	return (ARCHIVE_OK);
 }
+
+# vim:set noet:
