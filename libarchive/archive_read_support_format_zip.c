@@ -90,6 +90,7 @@ __FBSDID("$FreeBSD: head/lib/libarchive/archive_read_support_format_zip.c 201102
 #include "archive_rb.h"
 #include "archive_read_private.h"
 #include "archive_ppmd8_private.h"
+#include "archive_inflate64.h"
 
 #ifndef HAVE_ZLIB_H
 #include "archive_crc32.h"
@@ -211,6 +212,7 @@ struct zip {
 	IByteIn			zipx_ppmd_stream;
 	ssize_t			zipx_ppmd_read_compressed;
 	CPpmd8			ppmd8;
+	struct inflate64stream inf64stream;
 
 	struct archive_string_conv *sconv;
 	struct archive_string_conv *sconv_default;
@@ -261,11 +263,6 @@ struct zip {
 
 /* Many systems define min or MIN, but not all. */
 #define	zipmin(a,b) ((a) < (b) ? (a) : (b))
-
-static uint16_t 
-get_u16(const uint8_t* p) {
-	return *(const uint16_t*)p;
-}
 
 static Byte
 ppmd_read(void* p) {
@@ -1749,7 +1746,7 @@ zipx_ppmd8_init(struct archive_read *a, struct zip *zip)
 	}
 	__archive_read_consume(a, 2);
 
-	val = get_u16(p);
+	val = archive_le16dec(p);
 	order = (val & 15) + 1;
 	mem = ((val >> 4) & 0xff) + 1;
 	restore_method = (val >> 12);
@@ -1852,6 +1849,88 @@ zip_read_data_zipx_ppmd(struct archive_read *a, const void **buff,
 	return ARCHIVE_OK;
 }
 
+static int
+zipx_deflate64_init(struct archive_read* a, struct zip* zip) 
+{
+	(void) a;
+	(void) zip;
+
+	if(INF64_OK != inflate64init(&zip->inf64stream)) {
+		archive_set_error(&a->archive, ARCHIVE_ERRNO_PROGRAMMER,
+			"Inflate64 initialization error");
+		return ARCHIVE_FATAL;
+	}
+
+	if(zip->uncompressed_buffer)
+		free(zip->uncompressed_buffer);
+
+	zip->uncompressed_buffer_size = 256 * 1024;
+	zip->uncompressed_buffer = 
+		(uint8_t*) malloc(zip->uncompressed_buffer_size);
+
+	if(zip->uncompressed_buffer == NULL) {
+		archive_set_error(&a->archive, ENOMEM,
+			"No memory for ZIPx deflate64 decompression");
+		return ARCHIVE_FATAL;
+	}
+
+	zip->decompress_init = 1;
+	LOG("deflate64 init ok");
+	return ARCHIVE_OK;
+}
+
+static int
+zip_read_data_zipx_deflate64(struct archive_read *a, const void **buff,
+    size_t *size, int64_t *offset)
+{
+	struct zip* zip = (struct zip *)(a->format->data);
+	int ret;
+	size_t consumed_bytes = 0;
+	ssize_t bytes_avail = 0, in_bytes = 0;
+	const void* compressed_buf;
+
+	(void) offset; /* NOT USED */
+
+	if(!zip->decompress_init) {
+		ret = zipx_deflate64_init(a, zip);
+		if(ret != ARCHIVE_OK)
+			return ret;
+	}
+
+	(void) buff;
+	(void) size;
+	(void) consumed_bytes;
+	(void) bytes_avail;
+	(void) compressed_buf;
+
+	LOG("unpack");
+	compressed_buf = __archive_read_ahead(a, 1, &bytes_avail);
+	if(bytes_avail < 0) {
+		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+		    "Truncated ZIPx file body");
+		return (ARCHIVE_FATAL);
+	}
+
+	LOG("bytes avail: %zu", bytes_avail);
+	in_bytes = zipmin(zip->entry_bytes_remaining, bytes_avail);
+
+	zip->inf64stream.next_in = compressed_buf;
+	zip->inf64stream.avail_in = in_bytes;
+	zip->inf64stream.total_in = 0;
+	zip->inf64stream.next_out = zip->uncompressed_buffer;
+	zip->inf64stream.avail_out = zip->uncompressed_buffer_size;
+	zip->inf64stream.total_out = 0;
+
+	ret = inflate64run(&zip->inf64stream);
+	if(ret != ARCHIVE_OK) {
+		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+		    "Bad deflate64 stream");
+		return (ARCHIVE_FATAL);
+	}
+
+	return ARCHIVE_FATAL;
+}
+
 #ifdef HAVE_BZLIB_H
 static int
 zipx_bzip2_init(struct archive_read *a, struct zip *zip)
@@ -1894,6 +1973,7 @@ zip_read_data_zipx_bzip2(struct archive_read *a, const void **buff,
 	ssize_t bytes_avail = 0, in_bytes, to_consume;
 	const void *compressed_buff;
 	int r;
+	uint64_t total_out;
 
 	(void) offset; /* UNUSED */
 
@@ -1929,7 +2009,7 @@ zip_read_data_zipx_bzip2(struct archive_read *a, const void **buff,
 					break;
 				default:
 					archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
-						"Failed to clean up bzip2 decompressor");
+					    "Failed to clean up bzip2 decompressor");
 					return ARCHIVE_FATAL;
 			}
 
@@ -1939,18 +2019,21 @@ zip_read_data_zipx_bzip2(struct archive_read *a, const void **buff,
 			break;
 		default:
 			archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
-				"ZIPx BZIP2 decompression failed");
+			    "ZIPx BZIP2 decompression failed");
 			return ARCHIVE_FATAL;
 	}
 
 	to_consume = zip->bzstream.total_in_lo32;
 	__archive_read_consume(a, to_consume);
 
+	total_out = ((uint64_t) zip->bzstream.total_out_hi32 << 32) + 
+	    zip->bzstream.total_out_lo32;
+
 	zip->entry_bytes_remaining -= to_consume;
 	zip->entry_compressed_bytes_read += to_consume;
-	zip->entry_uncompressed_bytes_read += zip->bzstream.total_out_lo32;
+	zip->entry_uncompressed_bytes_read += total_out;
 
-	*size = zip->bzstream.total_out_lo32;
+	*size = total_out;
 	*buff = zip->uncompressed_buffer;
 
 	r = consume_optional_marker(a, zip);
@@ -2583,6 +2666,12 @@ archive_read_format_zip_read_data(struct archive_read *a,
 	case 98: /* ZIPx PPMd compression. */
 		r = zip_read_data_zipx_ppmd(a, buff, size, offset);
 		break;
+
+	/* Deflate64 support is built-in as well. */
+	case 9: /* Deflate64 compression. */
+		r = zip_read_data_zipx_deflate64(a, buff, size, offset);
+		break;
+
 #ifdef HAVE_ZLIB_H
 	case 8: /* Deflate compression. */
 		r =  zip_read_data_deflate(a, buff, size, offset);
