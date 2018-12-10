@@ -33,7 +33,7 @@ struct inflate64internal;
 
 enum INF64_RET {
     INF64_OK = 0, INF64_ALLOC = 1, INF64_ERROR = 2, INF64_ARG = 3, INF64_IO = 4,
-    INF64_BADDATA = 5,
+    INF64_BADDATA = 5, INF64_NEEDMORE = 6,
 };
 
 struct inflate64stream {
