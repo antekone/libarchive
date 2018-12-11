@@ -3,7 +3,7 @@
  * All rights reserved.
  *
  * This zlib-free deflate64 decoder is based on 7-Zip's deflate64 
- * decoder by Igor Pavlov.
+ * decoder by Igor Pavlov and Info-ZIP's inflate.c by Mark Adler.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -51,7 +51,7 @@
         \
         printf("\n");\
     } while(0)
-#define INF64_TRY(x) do { int __ret; if(INF64_OK != (__ret = (x))) { return __ret; } } while(0)
+#define INF64_TRY(x) do { int __ret; if(INF64_OK != (__ret = (x))) { LOG("TRY: error %d at %s:%d", __ret, __FILE__, __LINE__); return __ret; } } while(0)
 #define INF64_TRY_OR(x, ref) do { int __ret; if(INF64_OK != (__ret = (x))) { return __ret; } else { ref = __ret; } } while(0)
 #define INF64_COUNT_OF(x) (sizeof(x) / sizeof(*x))
 
@@ -76,7 +76,16 @@ struct huff_table {
     uint32_t dl;
     uint32_t lc;
     uint8_t levels[CODE_LENGTH_TABLE_SIZE];
-    uint8_t lens[1 << 7];
+    uint8_t lens_7bit[1 << 7]; /* 128 */
+    uint8_t ll_tab[MAIN_TABLE_SIZE];
+    uint8_t dl_tab[DIST_TABLE_SIZE];
+};
+
+struct decoder_ctx {
+    uint16_t lens_9bit[1 << 9]; /* 512 */
+    uint16_t symtab[MAIN_TABLE_SIZE];
+    uint32_t limtab[17];
+    uint32_t postab[16];
 };
 
 const uint8_t code_len_pos[CODE_LENGTH_TABLE_SIZE] = {
@@ -86,6 +95,7 @@ const uint8_t code_len_pos[CODE_LENGTH_TABLE_SIZE] = {
 struct inflate64internal {
     struct bit_reader br;
     struct huff_table huff;
+    struct decoder_ctx dec;
 };
 
 static
@@ -189,11 +199,15 @@ int br_read_n_u8p(struct inflate64stream* s, int n, uint8_t* pvalue) {
 
 static
 int valid_context(struct inflate64stream* s) {
-    return s->initialized == INIT_TAG && s->inner ? INF64_OK : INF64_ARG;
+    int ret = s->initialized == INIT_TAG && s->inner;
+    return ret ? INF64_OK : INF64_ARG;
 }
 
 int inflate64init(struct inflate64stream* s) {
-    INF64_TRY(valid_context(s));
+    /* Don't allow re-initialization of already initialized instance. */
+    if(INF64_OK == valid_context(s)) {
+        return INF64_ARG;
+    }
 
     s->inner = (struct inflate64internal*) malloc(sizeof(struct inflate64internal));
     if(!s->inner)
@@ -245,29 +259,29 @@ int levels_init(struct inflate64stream* s) {
     struct huff_table* const huff = &s->inner->huff;
     
     uint32_t len_counts[8] = { 0 };
-    uint32_t temp_poses[8] = { 0 };
-    uint32_t poses[8] = { 0 };
+    uint32_t temp_postab[8] = { 0 };
+    uint32_t postab[8] = { 0 };
     uint32_t limits[8] = { 0 };
     uint32_t sym = 0;
     uint32_t start_pos = 0;
 
     for(sym = 0; sym < INF64_COUNT_OF(huff->levels); ++sym) {
-        const size_t position = huff->levels[sym];
-        ++len_counts[position];
+        const size_t pos = huff->levels[sym];
+        ++len_counts[pos];
     }
 
     len_counts[0] = 0;
-    poses[0] = 0;
+    postab[0] = 0;
     limits[0] = 0;
 
     for(i = 1; i < 8; ++i) {
         start_pos += len_counts[i] << (7 - i);
-        if(start_pos > 128)
+        if(start_pos > (1 << 7))
             return INF64_BADDATA;
 
         limits[i] = start_pos;
-        poses[i] = poses[i - 1] + len_counts[i - 1];
-        temp_poses[i] = poses[i];
+        postab[i] = postab[i - 1] + len_counts[i - 1];
+        temp_postab[i] = postab[i];
     }
 
     for(sym = 0; sym < INF64_COUNT_OF(huff->levels); ++sym) {
@@ -282,34 +296,34 @@ int levels_init(struct inflate64stream* s) {
         /* 'len' will never be more than 7, because it's read from the
          * file by using only 3 bits. */
 
-        offset = temp_poses[len];
-        ++temp_poses[len];
-        offset -= poses[len];
+        offset = temp_postab[len];
+        ++temp_postab[len];
+        offset -= postab[len];
 
         val = (uint8_t) ((sym << 3) | len);
         index = limits[len - 1] + (offset << (7 - len));
         for(k = 0; k < (1 << (7 - len)); ++k) {
-            if((index + k) > (ssize_t) INF64_COUNT_OF(huff->lens)) {
-                LOG("fatal: index+k = %zu, should be max %zu", index + k, INF64_COUNT_OF(huff->lens));
+            if((index + k) > (ssize_t) INF64_COUNT_OF(huff->lens_7bit)) {
+                LOG("fatal: index+k = %zu, should be max %zu", index + k, INF64_COUNT_OF(huff->lens_7bit));
                 return INF64_BADDATA;
             }
 
             LOG("save val %02x to index+k=%zu", val, index+k);
-            huff->lens[index + k] = val;
+            huff->lens_7bit[index + k] = val;
         }
     }
 
     for(k = 0; k < (128 - limits[7]); ++k) {
-        if((limits[7] + k) > (ssize_t) INF64_COUNT_OF(huff->lens)) {
-            LOG("fatal: limits[7]+k = %zu, should be max %zu", limits[7] + k, INF64_COUNT_OF(huff->lens));
+        if((limits[7] + k) > (ssize_t) INF64_COUNT_OF(huff->lens_7bit)) {
+            LOG("fatal: limits[7]+k = %zu, should be max %zu", limits[7] + k, INF64_COUNT_OF(huff->lens_7bit));
             return INF64_BADDATA;
         }
 
-        huff->lens[limits[7] + k] = 0x1F << 3;
+        huff->lens_7bit[limits[7] + k] = 0x1F << 3;
     }
 
-    for(i = 0; i < INF64_COUNT_OF(huff->lens); ++i) {
-        LOG("2 lens[%zu] = %02x", i, huff->lens[i]);
+    for(sym = 0; sym < 128; sym++) {
+        LOG("lens_7bit[%d]=%d", sym, huff->lens_7bit[sym]);
     }
 
     return INF64_OK;
@@ -322,15 +336,11 @@ int levels_decode(struct inflate64stream* s, uint8_t* levels, int sym_count) {
     uint32_t num_bits = 0, num = 0, bit_data = 0;
     uint8_t symbol = 0;
 
-    (void) s;
-    (void) levels;
-    (void) sym_count;
-
     uint32_t val, pair, len, sym;
 
     do {
         INF64_TRY(br_readval_n(s, 7, &val));
-        pair = huff->lens[val];
+        pair = huff->lens_7bit[val];
 
         len = pair & 7;
         br_skip(s, len);
@@ -378,14 +388,92 @@ int levels_decode(struct inflate64stream* s, uint8_t* levels, int sym_count) {
 }
 
 static
+int decoder_init(struct inflate64stream* s) {
+    struct huff_table* huff = &s->inner->huff;
+    struct decoder_ctx* dec = &s->inner->dec;
+    uint32_t len_counts[INF64_COUNT_OF(dec->postab)];
+    uint32_t tmp_postab[INF64_COUNT_OF(dec->postab)];
+    uint32_t i, sym, start_pos = 0;
+
+    // kNumBitsMax = 15
+    // m_numSymbols = MAIN_TABLE_SIZE
+    // kNumTableBits = 9
+
+    memset(len_counts, 0, sizeof(len_counts));
+
+    for(sym = 0; sym < MAIN_TABLE_SIZE; ++sym) {
+        const size_t pos = huff->ll_tab[sym];
+        len_counts[pos]++;
+    }
+
+    len_counts[0] = 0;
+    dec->postab[0] = 0;
+    dec->limtab[0] = 0;
+
+    for(i = 1; i < 15; ++i) {
+        start_pos = start_pos + (len_counts[i] << (15 - i));
+        if(start_pos > (1 << 15)) {
+            LOG("Wrong start_pos");
+            return INF64_BADDATA;
+        }
+
+        dec->limtab[i] = start_pos;
+        dec->postab[i] = dec->postab[i - 1] + len_counts[i - 1];
+        tmp_postab[i] = dec->postab[i];
+    }
+
+    dec->limtab[16] = 1 << 15;
+
+    for(sym = 0; sym < MAIN_TABLE_SIZE; ++sym) {
+        uint32_t offset;
+        uint32_t len = huff->ll_tab[sym];
+        if(len == 0)
+            continue;
+
+        offset = tmp_postab[len];
+        dec->symtab[offset] = (uint16_t) sym;
+        tmp_postab[len] = offset + 1;
+
+        LOG("len=%d, offset=%d, sym=%d", len, offset, sym);
+
+        if(len <= 9) {
+            uint32_t num, k;
+            uint16_t val;
+
+            offset = offset - dec->postab[len];
+            num = (uint32_t) 1 << (9 - len);
+            val = (uint16_t) ((sym << 4) | len);
+            LOG("num=%d, val=%d", num, val);
+            k = (dec->limtab[len - 1] >> (15 - 9)) + (offset << (9 - len));
+
+            for(i = 0; i < num; i++) {
+                dec->lens_9bit[i + k] = val;
+            }
+        }
+    }
+
+    for(i = 0; i < (1 << 9); i++) {
+        LOG("lens_9bit[%d]=%d", i, dec->lens_9bit[i]);
+    }
+
+    return INF64_OK;
+}
+
+static
 int read_table_huff_dyn(struct inflate64stream* s) {
+    struct huff_table* huff = &s->inner->huff;
     uint8_t temp_levels[MAIN_TABLE_SIZE + DIST_TABLE_SIZE];
 
     INF64_TRY(levels_load(s));
     INF64_TRY(levels_init(s));
-    INF64_TRY(levels_decode(s, 
-                temp_levels, 
-                s->inner->huff.ll + s->inner->huff.dl));
+    INF64_TRY(levels_decode(s, temp_levels, huff->ll + huff->dl));
+
+    memset(huff->ll_tab, 0, MAIN_TABLE_SIZE);
+    memcpy(huff->ll_tab, temp_levels, huff->ll);
+    memset(huff->dl_tab, 0, DIST_TABLE_SIZE);
+    memcpy(huff->dl_tab, &temp_levels[huff->ll], huff->dl);
+
+    INF64_TRY(decoder_init(s));
 
     return INF64_OK;
 }
