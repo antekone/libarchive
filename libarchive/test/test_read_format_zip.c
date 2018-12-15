@@ -312,3 +312,7 @@ DEFINE_TEST(test_read_format_zip)
 	test_extract_length_at_end();
 	test_symlink();
 }
+
+DEFINE_TEST(test_read_format_zip_ppmd)
+{
+}
