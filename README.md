@@ -221,3 +221,4 @@ questions we are asked about libarchive:
   (including the legacy GNU tar format) and is widely supported by
   current tar implementations.
 
+test
