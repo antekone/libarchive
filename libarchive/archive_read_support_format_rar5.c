@@ -498,6 +498,13 @@ static inline struct rar5* get_context(struct archive_read* a) {
 	return (struct rar5*) a->format->data;
 }
 
+/* Returns 0 if range check failed, and the offset is beyond the boundary.
+ * Returns 1 if range check succeeded, and offset is inside the boundary. */
+static inline int bits_range_check(struct rar5* rar, int offset) {
+	return ((rar->bits.in_addr + offset) > rar->cstate.cur_block_size) ?
+	    0 : 1;
+}
+
 /* Convenience functions used by filter implementations. */
 static void circular_memcpy(uint8_t* dst, uint8_t* window, const uint64_t mask,
     int64_t start, int64_t end)
@@ -2404,6 +2411,9 @@ static int decode_number(struct archive_read* a, struct decode_table* table,
 	uint32_t pos;
 	struct rar5* rar = get_context(a);
 
+	if(bits_range_check(rar, 1) == 0)
+		return ARCHIVE_EOF;
+
 	if(ARCHIVE_OK != read_bits_16(rar, p, &bitfield)) {
 		return ARCHIVE_EOF;
 	}
@@ -2437,6 +2447,14 @@ static int decode_number(struct archive_read* a, struct decode_table* table,
 
 	*num = table->decode_num[pos];
 	return ARCHIVE_OK;
+}
+
+/* Convinience function that creates the 'huffman table overflow' error. */
+static int huffman_overflow(struct archive_read* a, int place) {
+	archive_set_error(&a->archive,
+	    ARCHIVE_ERRNO_FILE_FORMAT,
+	    "Truncated data in huffman tables (#%d)", place);
+	return ARCHIVE_FATAL;
 }
 
 /* Reads and parses Huffman tables from the beginning of the block. */
@@ -2511,12 +2529,9 @@ static int parse_tables(struct archive_read* a, struct rar5* rar,
 	for(i = 0; i < HUFF_TABLE_SIZE;) {
 		uint16_t num;
 
-		if((rar->bits.in_addr + 6) >= rar->cstate.cur_block_size) {
+		if(bits_range_check(rar, 2) == 0) {
 			/* Truncated data, can't continue. */
-			archive_set_error(&a->archive,
-			    ARCHIVE_ERRNO_FILE_FORMAT,
-			    "Truncated data in huffman tables (#2)");
-			return ARCHIVE_FATAL;
+			return huffman_overflow(a, 0);
 		}
 
 		ret = decode_number(a, &rar->cstate.bd, p, &num);
@@ -2537,6 +2552,10 @@ static int parse_tables(struct archive_read* a, struct rar5* rar,
 		if(num < 18) {
 			/* 16..17: repeat previous code */
 			uint16_t n;
+
+			if(bits_range_check(rar, 2) == 0)
+				return huffman_overflow(a, 1);
+
 			if(ARCHIVE_OK != read_bits_16(rar, p, &n))
 				return ARCHIVE_EOF;
 
@@ -2568,6 +2587,10 @@ static int parse_tables(struct archive_read* a, struct rar5* rar,
 
 		/* other codes: fill with zeroes `n` times */
 		uint16_t n;
+
+		if(bits_range_check(rar, 2) == 0)
+			return huffman_overflow(a, 2);
+
 		if(ARCHIVE_OK != read_bits_16(rar, p, &n))
 			return ARCHIVE_EOF;
 
@@ -2697,6 +2720,9 @@ static int parse_filter_data(struct rar5* rar, const uint8_t* p,
 	for(i = 0; i < bytes; i++) {
 		uint16_t byte;
 
+		if(bits_range_check(rar, 2) == 0)
+			return ARCHIVE_EOF;
+
 		if(ARCHIVE_OK != read_bits_16(rar, p, &byte)) {
 			return ARCHIVE_EOF;
 		}
@@ -2746,6 +2772,9 @@ static int parse_filter(struct archive_read* ar, const uint8_t* p) {
 		return ARCHIVE_EOF;
 
 	if(ARCHIVE_OK != parse_filter_data(rar, p, &block_length))
+		return ARCHIVE_EOF;
+
+	if(bits_range_check(rar, 2) == 0)
 		return ARCHIVE_EOF;
 
 	if(ARCHIVE_OK != read_bits_16(rar, p, &filter_type))
