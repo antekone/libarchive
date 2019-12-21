@@ -2416,9 +2416,6 @@ static int decode_number(struct archive_read* a, struct decode_table* table,
 	uint32_t pos;
 	struct rar5* rar = get_context(a);
 
-	if(bits_range_check(rar, 1) == 0)
-		return ARCHIVE_EOF;
-
 	if(ARCHIVE_OK != read_bits_16(rar, p, &bitfield)) {
 		return ARCHIVE_EOF;
 	}
@@ -2725,9 +2722,6 @@ static int parse_filter_data(struct rar5* rar, const uint8_t* p,
 	for(i = 0; i < bytes; i++) {
 		uint16_t byte;
 
-		if(bits_range_check(rar, 2) == 0)
-			return ARCHIVE_EOF;
-
 		if(ARCHIVE_OK != read_bits_16(rar, p, &byte)) {
 			return ARCHIVE_EOF;
 		}
@@ -2777,9 +2771,6 @@ static int parse_filter(struct archive_read* ar, const uint8_t* p) {
 		return ARCHIVE_EOF;
 
 	if(ARCHIVE_OK != parse_filter_data(rar, p, &block_length))
-		return ARCHIVE_EOF;
-
-	if(bits_range_check(rar, 2) == 0)
 		return ARCHIVE_EOF;
 
 	if(ARCHIVE_OK != read_bits_16(rar, p, &filter_type))
