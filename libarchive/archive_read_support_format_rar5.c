@@ -2526,7 +2526,7 @@ static int parse_tables(struct archive_read* a, struct rar5* rar,
 	for(i = 0; i < HUFF_TABLE_SIZE;) {
 		uint16_t num;
 
-		if(bits_range_check(rar, 2) == 0) {
+		if(bits_range_check(rar, 1) == 0) {
 			/* Truncated data, can't continue. */
 			return huffman_overflow(a, 0);
 		}
