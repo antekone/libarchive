@@ -3335,6 +3335,11 @@ static int process_block(struct archive_read* a) {
 	if(rar->cstate.block_parsing_finished) {
 		ssize_t block_size;
 
+		if(rar->file.bytes_remaining == 0) {
+			rar->file.eof = 1;
+			return ARCHIVE_EOF;
+		}
+
 		/* The header size won't be bigger than 6 bytes. */
 		if(!read_ahead(a, 6, &p)) {
 			/* Failed to prefetch data block header. */
@@ -3609,8 +3614,8 @@ static int do_uncompress_file(struct archive_read* a) {
 			if(ret == ARCHIVE_EOF || ret == ARCHIVE_FATAL)
 				return ret;
 
-			if(rar->cstate.last_write_ptr ==
-			    rar->cstate.write_ptr) {
+			if(rar->file.bytes_remaining > 0 && (
+			    rar->cstate.last_write_ptr == rar->cstate.write_ptr)) {
 				/* The block didn't generate any new data,
 				 * so just process a new block. */
 				continue;
