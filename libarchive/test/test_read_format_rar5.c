@@ -1310,6 +1310,8 @@ DEFINE_TEST(test_read_format_rar5_sfx)
 
 	assertA(size == archive_read_data(a, buff, size));
 	assertEqualMem(buff, test_txt, size);
+
+	EPILOGUE();
 }
 
 DEFINE_TEST(test_read_format_rar5_decode_number_out_of_bounds_read)
@@ -1344,6 +1346,21 @@ DEFINE_TEST(test_read_format_rar5_bad_window_size_in_multiarchive_file)
 	while(0 < archive_read_data(a, buf, sizeof(buf))) {}
 	(void) archive_read_next_header(a, &ae);
 	while(0 < archive_read_data(a, buf, sizeof(buf))) {}
+
+	EPILOGUE();
+}
+
+DEFINE_TEST(test_read_format_rar5_undefined_state)
+{
+	/* github issue 1738 */
+
+	PROLOGUE("test_read_format_rar5_undefined_state.rar");
+
+	/* This archive file is valid, but it triggered valgrind warnings
+	 * because of branching based on uninitialized values. */
+
+	assertA(0 == archive_read_next_header(a, &ae));
+	assertA(0 == extract_one(a, ae, 0x4BD4EBAB));
 
 	EPILOGUE();
 }
