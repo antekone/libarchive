@@ -1669,7 +1669,6 @@ static int process_head_file_extra(struct archive_read* a,
 				archive_entry_set_is_data_encrypted(e, 1);
 				rar->has_encrypted_entries = 1;
 				rar->cstate.data_encrypted = 1;
-
 				/* fallthrough */
 			case EX_SUBDATA:
 				/* fallthrough */
